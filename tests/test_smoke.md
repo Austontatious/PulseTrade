@@ -1,0 +1,5 @@
+- [ ] Docker builds succeed
+- [ ] API /health returns ok
+- [ ] Coinbase/Kraken trades populate `trades` table
+- [ ] Forecast rows appear in `forecasts`
+- [ ] /signals/latest returns latest for BTCUSD/ETHUSD

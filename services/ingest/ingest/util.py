@@ -1,0 +1,1 @@
+"""Shared ingest utilities placeholder."""

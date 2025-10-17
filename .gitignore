@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+dist/
+node_modules/
+.eggs/
+coverage/
+.mypy_cache/
+.cache/
+.DS_Store
