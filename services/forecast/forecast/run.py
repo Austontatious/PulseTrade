@@ -1,11 +1,17 @@
-import asyncpg, os, asyncio, pandas as pd, json
+import asyncpg, os, asyncio, pandas as pd, json, random
 from typing import Any, Dict, List
 from .model_swap import Model
 
 DB_DSN = f"postgresql://{os.getenv('POSTGRES_USER','pulse')}:{os.getenv('POSTGRES_PASSWORD','pulsepass')}@" \
          f"{os.getenv('POSTGRES_HOST','db')}:{os.getenv('POSTGRES_PORT','5432')}/{os.getenv('POSTGRES_DB','pulse')}"
 
-TICKERS = ["BTCUSD", "ETHUSD"]  # extend from symbols table later
+# Preferred order of sources for forecast universe:
+# 1) FORECAST_TICKERS (explicit override)
+# 2) SYMBOLS (shared env across services)
+# 3) Fallback crypto only
+_tickers_env = os.getenv("FORECAST_TICKERS") or os.getenv("SYMBOLS", "")
+ENV_TICKERS = [t.strip() for t in _tickers_env.split(",") if t and t.strip()] or ["BTCUSD", "ETHUSD"]
+FORECAST_MAX_TICKERS = int(os.getenv("FORECAST_MAX_TICKERS", "50"))
 HORIZON = "1m"
 MODEL = Model()
 MODEL_NAME = MODEL.__class__.__name__
@@ -59,7 +65,17 @@ async def main():
     while True:
         conn = await asyncpg.connect(dsn=DB_DSN)
         try:
-            for t in TICKERS:
+            # Dynamic universe: union of env and discovered equities from DB symbols
+            try:
+                rows = await conn.fetch("SELECT ticker FROM symbols WHERE class='equity' ORDER BY ticker ASC LIMIT 500")
+                dyn = [r[0] for r in rows]
+            except Exception:
+                dyn = []
+            all_ticks = list({*ENV_TICKERS, *dyn})
+            if len(all_ticks) > FORECAST_MAX_TICKERS:
+                random.shuffle(all_ticks)
+                all_ticks = all_ticks[:FORECAST_MAX_TICKERS]
+            for t in all_ticks:
                 await forecast_once(conn, t)
         finally:
             await conn.close()

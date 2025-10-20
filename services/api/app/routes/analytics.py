@@ -29,3 +29,29 @@ async def recent_activity(ticker: str):
         }
     finally:
         await conn.close()
+
+@router.get("/fills")
+async def recent_fills(ticker: str | None = None, limit: int = 50):
+    conn = await asyncpg.connect(dsn=DB_DSN)
+    try:
+        if ticker:
+            rows = await conn.fetch(
+                """SELECT ts, ticker, side, qty, price, venue, meta
+                    FROM fills
+                    WHERE ticker=$1
+                    ORDER BY ts DESC
+                    LIMIT $2""",
+                ticker,
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """SELECT ts, ticker, side, qty, price, venue, meta
+                    FROM fills
+                    ORDER BY ts DESC
+                    LIMIT $1""",
+                limit,
+            )
+        return [dict(row) for row in rows]
+    finally:
+        await conn.close()
