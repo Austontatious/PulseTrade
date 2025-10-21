@@ -3,6 +3,7 @@ import math
 import json
 from typing import Optional, Tuple
 import asyncpg
+import datetime as dt
 
 THRESH = float(os.getenv("PLANNER_DEV_THRESH", "0.0001"))  # 0.01%
 R_MULT = float(os.getenv("PLANNER_R_MULT", "2.0"))        # target reward/risk
@@ -46,6 +47,30 @@ async def recent_volatility(conn: asyncpg.Connection, ticker: str) -> Optional[f
     # approximate ATR as sigma * last_price
     last = prices[-1]
     return sigma * last
+
+async def latest_quote(conn: asyncpg.Connection, ticker: str) -> Optional[Tuple[float, float, object]]:
+    row = await conn.fetchrow(
+        """
+        SELECT ts, bid, ask FROM quotes
+        WHERE ticker=$1 ORDER BY ts DESC LIMIT 1
+        """,
+        ticker,
+    )
+    if not row:
+        return None
+    return float(row["bid"] or 0.0), float(row["ask"] or 0.0), row["ts"]
+
+async def in_event_blackout(conn: asyncpg.Connection, ticker: str) -> bool:
+    row = await conn.fetchrow(
+        """
+        SELECT 1 FROM event_windows
+        WHERE (ticker IS NULL OR ticker=$1)
+          AND NOW() BETWEEN start_ts AND end_ts
+        LIMIT 1
+        """,
+        ticker,
+    )
+    return bool(row)
 
 async def latest_forecast(conn: asyncpg.Connection, ticker: str) -> Optional[Tuple[float,float,float]]:
     row = await conn.fetchrow(
@@ -126,6 +151,10 @@ async def plan_limit_order(conn: asyncpg.Connection, ticker: str) -> Optional[di
     # Cooldown to avoid spamming
     if await _recent_planner_fill(conn, ticker):
         return None
+    # Event blackout
+    if os.getenv("ENABLE_EARNINGS_BLACKOUT", "1") == "1":
+        if await in_event_blackout(conn, ticker):
+            return None
     price = await latest_price(conn, ticker)
     fc = await latest_forecast(conn, ticker)
     atr = await recent_volatility(conn, ticker)
@@ -168,13 +197,35 @@ async def plan_limit_order(conn: asyncpg.Connection, ticker: str) -> Optional[di
         if side == "sell" and fscore > 0:
             return None
 
-    # Simple R:R planning around ATR
-    # Nudge entry toward favorable side to improve fill odds
-    entry = price - ENTRY_ATR_FRAC*atr if side == "buy" else price + ENTRY_ATR_FRAC*atr
+    # Simple R:R planning around ATR with quote/spread guard
+    # Quote/Spread filter
+    max_spread_bps = float(os.getenv("MAX_SPREAD_BPS", "8"))
+    max_quote_age = int(os.getenv("MAX_QUOTE_AGE_SECS", "5"))
+    spread_frac = float(os.getenv("ENTRY_SPREAD_FRAC", "0.25"))
+    bid_ask = await latest_quote(conn, ticker)
+    if bid_ask:
+        bid, ask, qts = bid_ask
+        if bid > 0 and ask > 0 and ask >= bid:
+            mid = 0.5*(bid+ask)
+            spread_bps = (ask-bid)/mid*1e4 if mid > 0 else 1e9
+            age_ok = (dt.datetime.now(dt.timezone.utc) - qts).total_seconds() <= max_quote_age
+            if (spread_bps > max_spread_bps) or (not age_ok):
+                return None
+            # Maker-like nudge at fraction of spread
+            entry = (mid - spread_frac*(ask-bid)) if side == "buy" else (mid + spread_frac*(ask-bid))
+        else:
+            entry = price - ENTRY_ATR_FRAC*atr if side == "buy" else price + ENTRY_ATR_FRAC*atr
+    else:
+        entry = price - ENTRY_ATR_FRAC*atr if side == "buy" else price + ENTRY_ATR_FRAC*atr
     stop = entry - atr if side == "buy" else entry + atr
     target = entry + R_MULT*atr if side == "buy" else entry - R_MULT*atr
-    # Qty from notional
-    qty = max(LIMIT_NOTIONAL/entry, 0.0001)
+    # Sizing: vol-targeted (risk per trade) or notional
+    use_vol_target = os.getenv("USE_VOL_TARGETED", "1") == "1"
+    if use_vol_target and atr > 0:
+        risk_dollars = float(os.getenv("RISK_DOLLARS_PER_TRADE", "10"))
+        qty = max(risk_dollars/max(atr, 1e-6), 0.0001)
+    else:
+        qty = max(LIMIT_NOTIONAL/max(entry, 1e-6), 0.0001)
     plan = {
         "ticker": ticker,
         "side": side,

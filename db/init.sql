@@ -114,3 +114,57 @@ CREATE TABLE IF NOT EXISTS rate_events (
   meta JSONB DEFAULT '{}'::jsonb
 );
 SELECT create_hypertable('rate_events','ts', if_not_exists => TRUE);
+
+-- Quotes (for spread/latency filters)
+CREATE TABLE IF NOT EXISTS quotes (
+  ts TIMESTAMPTZ NOT NULL,
+  ticker TEXT NOT NULL,
+  bid DOUBLE PRECISION,
+  ask DOUBLE PRECISION,
+  venue TEXT,
+  meta JSONB DEFAULT '{}'::jsonb
+);
+SELECT create_hypertable('quotes','ts', if_not_exists => TRUE);
+
+-- Event windows (earnings/macro blackouts)
+CREATE TABLE IF NOT EXISTS event_windows (
+  id BIGSERIAL PRIMARY KEY,
+  ticker TEXT,
+  start_ts TIMESTAMPTZ NOT NULL,
+  end_ts TIMESTAMPTZ NOT NULL,
+  kind TEXT NOT NULL,            -- earnings, macro
+  meta JSONB DEFAULT '{}'::jsonb
+);
+
+-- Circuit breakers log
+CREATE TABLE IF NOT EXISTS circuit_breakers (
+  ts TIMESTAMPTZ NOT NULL,
+  scope TEXT NOT NULL,      -- symbol, sector, global
+  key TEXT NOT NULL,        -- ticker, sector name, or 'ALL'
+  active BOOLEAN NOT NULL,
+  reason TEXT,
+  expires_at TIMESTAMPTZ,
+  meta JSONB DEFAULT '{}'::jsonb
+);
+
+-- Strategist: recommendations and policy knobs
+CREATE TABLE IF NOT EXISTS strategist_recos (
+  id BIGSERIAL PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL,
+  ticker TEXT NOT NULL,
+  side TEXT NOT NULL,            -- buy/sell
+  score DOUBLE PRECISION NOT NULL,
+  horizon TEXT,
+  reason TEXT,
+  meta JSONB DEFAULT '{}'::jsonb
+);
+SELECT create_hypertable('strategist_recos','ts', if_not_exists => TRUE);
+
+CREATE TABLE IF NOT EXISTS policy_knobs (
+  id BIGSERIAL PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL,
+  key TEXT NOT NULL,
+  value JSONB NOT NULL,
+  expires_at TIMESTAMPTZ,
+  meta JSONB DEFAULT '{}'::jsonb
+);

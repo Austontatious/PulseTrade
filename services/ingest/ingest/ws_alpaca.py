@@ -51,8 +51,8 @@ async def _ingest_ws(url: str, label: str) -> None:
             async with websockets.connect(url, ping_interval=20) as ws:
                 await ws.send(json.dumps({"action": "auth", "key": API_KEY, "secret": API_SECRET}))
                 print(f"alpaca auth sent [{label}]")
-                await ws.send(json.dumps({"action": "subscribe", "trades": SYMBOLS}))
-                print(f"alpaca subscribe sent [{label}]")
+                await ws.send(json.dumps({"action": "subscribe", "trades": SYMBOLS, "quotes": SYMBOLS}))
+                print(f"alpaca subscribe sent [{label}] (trades+quotes)")
                 conn = await asyncpg.connect(dsn=DB_DSN)
                 try:
                     dbg = 0
@@ -102,6 +102,23 @@ async def _ingest_ws(url: str, label: str) -> None:
                                         event.get("S"),
                                         price,
                                         size,
+                                        f"ALPACA_{label.upper()}",
+                                        json.dumps(event),
+                                    )
+                                elif etype == "q":
+                                    # Quotes
+                                    tval = event.get("t")
+                                    ts = _parse_ts(tval)
+                                    if ts is None:
+                                        continue
+                                    bid = float(event.get("bp") or 0.0)
+                                    ask = float(event.get("ap") or 0.0)
+                                    await conn.execute(
+                                        "INSERT INTO quotes(ts,ticker,bid,ask,venue,meta) VALUES($1,$2,$3,$4,$5,$6)",
+                                        ts,
+                                        event.get("S"),
+                                        bid,
+                                        ask,
                                         f"ALPACA_{label.upper()}",
                                         json.dumps(event),
                                     )

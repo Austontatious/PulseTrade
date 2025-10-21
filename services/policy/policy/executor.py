@@ -76,6 +76,7 @@ async def submit_order(
     take_profit_limit: Optional[float] = None,
     stop_loss_stop: Optional[float] = None,
     stop_loss_limit: Optional[float] = None,
+    stop_price: Optional[float] = None,
 ) -> Optional[dict]:
     url = _orders_url()
     otype = (order_type or ALPACA_ORDER_TYPE).lower()
@@ -93,6 +94,11 @@ async def submit_order(
             raise ValueError("limit orders require qty and limit_price")
         payload["qty"] = qty
         payload["limit_price"] = float(limit_price)
+    elif otype == "stop":
+        if qty is None or stop_price is None:
+            raise ValueError("stop orders require qty and stop_price")
+        payload["qty"] = qty
+        payload["stop_price"] = float(stop_price)
     else:
         # Market order: prefer notional when configured
         if notional is not None:
@@ -192,6 +198,26 @@ async def get_open_orders(symbol: str) -> List[Dict[str, Any]]:
     _open_cache[cache_key] = {"ts": now, "data": data}
     return data
 
+async def latest_quote(ticker: str) -> Optional[Dict[str, Any]]:
+    # This executor-level quote fetch uses DB to keep it simple
+    import asyncpg
+    import datetime as dt
+    DB_DSN = (
+        f"postgresql://{os.getenv('POSTGRES_USER', 'pulse')}:{os.getenv('POSTGRES_PASSWORD', 'pulsepass')}@"
+        f"{os.getenv('POSTGRES_HOST', 'db')}:{os.getenv('POSTGRES_PORT', '5432')}/{os.getenv('POSTGRES_DB', 'pulse')}"
+    )
+    conn = await asyncpg.connect(dsn=DB_DSN)
+    try:
+        row = await conn.fetchrow(
+            "SELECT ts, bid, ask FROM quotes WHERE ticker=$1 ORDER BY ts DESC LIMIT 1",
+            ticker,
+        )
+        if not row:
+            return None
+        return {"ts": row["ts"], "bid": row["bid"], "ask": row["ask"]}
+    finally:
+        await conn.close()
+
 async def maybe_submit_order(
     symbol: str,
     side: str,
@@ -203,6 +229,7 @@ async def maybe_submit_order(
     take_profit_limit: Optional[float] = None,
     stop_loss_stop: Optional[float] = None,
     stop_loss_limit: Optional[float] = None,
+    stop_price: Optional[float] = None,
 ) -> Optional[dict]:
     if not ALPACA_ENABLED or not ALPACA_KEY or not ALPACA_SECRET:
         return None
@@ -219,6 +246,7 @@ async def maybe_submit_order(
             take_profit_limit=take_profit_limit,
             stop_loss_stop=stop_loss_stop,
             stop_loss_limit=stop_loss_limit,
+            stop_price=stop_price,
         )
     except Exception as exc:  # pragma: no cover - network failure logging
         print("alpaca submit error:", exc)

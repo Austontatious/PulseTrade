@@ -82,8 +82,17 @@ git push origin main
 ```
 
 
-## Next steps (swaps)
-- Replace baseline forecaster with TimesFM/Chronos.
-- Add real analyst & recommendation feeds (Finnhub/FMP) and weight by historical accuracy.
-- Add equities live feed (Alpaca Market Data websockets) or your vendor of choice.
-- Add Congress trade events (QuiverQuant/CapitolTrades) -> feature flags.
+## Execution Quality & Risk Controls (shipped)
+- Quote-aware filtering: skips orders when spreads are wide or quotes stale; uses maker-like entry prices.
+- Vol-targeted sizing: sizes so a 1×ATR stop ≈ `RISK_DOLLARS_PER_TRADE`.
+- Earnings blackout: avoids trading around scheduled earnings windows.
+- Fractional exits: places stop/target child orders for fractional entries (brackets not allowed for fractionals).
+- Rate limiting + dedupe: caps orders/sec and avoids duplicate open orders per side/ticker.
+- Circuit breakers: per-symbol and global anomaly trips to halt new entries in dislocated tapes.
+
+See docs/PLANNING_EXECUTION.md for a deep-dive on planning and execution logic.
+
+## Next steps (ideas)
+- Swap in a stronger forecaster (TimesFM/Chronos) or your model.
+- Add sector breakers and macro blackout (CPI/FOMC) schedule.
+- Improve sentiment via FinBERT small model and handle weighting/anti-bot heuristics.

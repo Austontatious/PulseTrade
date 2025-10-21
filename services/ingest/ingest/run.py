@@ -9,6 +9,7 @@ from .collectors.finnhub import fetch_and_store as finnhub_fetch
 from .collectors.fmp import fetch_targets as fmp_targets
 from .collectors.fmp_screens import fetch_screens as fmp_screens
 from .collectors.stocktwits_trending import fetch_trending_symbols as st_trending
+from .collectors.fmp_calendar import fetch_earnings_calendar
 from .collectors.stocktwits import fetch_symbol as stocktwits_fetch
 from .collectors.truthsocial import fetch_latest as truthsocial_fetch
 from .collectors.quiver import fetch_congress_trades as quiver_fetch
@@ -29,6 +30,8 @@ async def poll_http_sources() -> None:
             coros.append(fmp_screens())
         if os.getenv("ENABLE_STOCKTWITS_TRENDING", "1") == "1":
             coros.append(st_trending())
+        if os.getenv("ENABLE_EARNINGS_BLACKOUT", "1") == "1":
+            coros.append(fetch_earnings_calendar())
         if os.getenv("ENABLE_STOCKTWITS", "0") == "1":
             symbols = [t for t in TICKERS if not t.endswith("USD")]
             coros.extend(stocktwits_fetch(sym) for sym in symbols)
