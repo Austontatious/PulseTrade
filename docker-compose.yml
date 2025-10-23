@@ -99,12 +99,152 @@ services:
         condition: service_started
     command: ["python", "-m", "policy.run"]
 
+  strategist:
+    build:
+      context: .
+      dockerfile: services/strategist/Dockerfile
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${STRATEGIST_GPU:-}
+    command: ["python", "-m", "strategist.run"]
+
   prometheus:
     image: prom/prometheus:latest
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports: ["9090:9090"]
     depends_on: [api]
+  kronos-nbeats:
+    build: ./services/kronos-nbeats
+    runtime: nvidia
+    restart: unless-stopped
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - MODELS_DIR=/models
+      - MODEL_DIR=${KRONOS_NBEATS_MODEL_DIR:-}
+      - API_KEY=${KRONOS_NBEATS_API_KEY:-changeme}
+      - AUTORELOAD=${KRONOS_NBEATS_AUTORELOAD:-0}
+      - CALIBRATION_FILE=/state/calibration.parquet
+      - CALIBRATION_ENABLED=${KRONOS_CALIBRATION_ENABLED:-1}
+      - SERVICE_NAME=kronos-nbeats
+      - PYTORCH_ENABLE_MPS_FALLBACK=1
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - /mnt/data/models:/models:ro
+      - ./libs:/app/libs:ro
+      - /mnt/data/kronos_state:/state:ro
+    ports: ["8080:8080"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              count: 1
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+
+  kronos-graph:
+    build: ./services/kronos-graph
+    runtime: nvidia
+    restart: unless-stopped
+    environment:
+      - CUDA_VISIBLE_DEVICES=1
+      - MODELS_DIR=/models
+      - SERVICE_NAME=kronos-graph
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - /mnt/data/models:/models:ro
+    ports: ["8081:8081"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              count: 1
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+
+  kronos-scenarios:
+    build: ./services/kronos-scenarios
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - SCENARIO_MODEL_DIR=/models/kronos-scenarios/latest
+      - API_KEY=${KRONOS_SCENARIOS_API_KEY}
+    volumes:
+      - /mnt/data/models:/models:ro
+      - ./libs:/app/libs:ro
+    ports: ["8082:8082"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{ capabilities: [gpu], count: 1 }]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8082/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+
+  kronos-graphx:
+    build: ./services/kronos-graphx
+    environment:
+      - CUDA_VISIBLE_DEVICES=1
+      - GRAPHX_MODEL_DIR=/models/kronos-graphx/latest
+      - API_KEY=${KRONOS_GRAPHX_API_KEY}
+    volumes:
+      - /mnt/data/models:/models:ro
+      - ./libs:/app/libs:ro
+    ports: ["8083:8083"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{ capabilities: [gpu], count: 1 }]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8083/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+
+  kronos-tft:
+    build: ./services/kronos-tft
+    environment:
+      - API_KEY=${KRONOS_TFT_API_KEY}
+      - TFT_MODEL_DIR=/models/kronos-tft/latest
+    volumes:
+      - /mnt/data/models:/models:ro
+    ports: ["8084:8084"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{ capabilities: [gpu], count: 1 }]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8084/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+
+  tools:
+    build: ./services/tools-runner
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql://pulse:pulsepass@db:5432/pulse}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - .:/workspace
+      - /mnt/data:/mnt/data
+    working_dir: /workspace
+    depends_on:
+      - db
 
 volumes:
   db_data:
