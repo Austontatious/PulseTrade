@@ -81,6 +81,47 @@ ALLOW_EXIT_OUTSIDE_UNIVERSE=1
 
 At runtime `policy` logs the resolved view and tradable count. Update the view definitions in `db/migrations/20251023_top100_universe.sql` as your liquidity heuristics evolve.
 
+### Trading knobs and troubleshooting no-trade scenarios
+
+If you aren’t seeing trades after bringing the stack up, start by loosening the decision gates in `.env` and then tighten them back once you confirm the loop is working.
+
+Common gates to tune (safer defaults for initial bring-up):
+
+```
+# Planner sensitivity and cooldown
+PLANNER_Z_DEV_THRESH=1.2          # was 1.8–2.0; lower is more permissive
+PLANNER_COOLDOWN_MINS=10          # was 30
+
+# Policy entry guards
+POLICY_REQUIRE_RECO=0             # do not require strategist reco to enter
+POLICY_MIN_ABS_DEV=0.0007         # minimum absolute deviation (0.07%)
+POLICY_MIN_SIGMA_Z=1.5            # z threshold on signal strength
+POLICY_MIN_NOTIONAL_USD=50        # reduce if entries are too small to place
+POLICY_MIN_TRADE_INTERVAL_SECS=60
+
+# Quote quality filters
+MAX_SPREAD_BPS=12
+MAX_QUOTE_AGE_SECS=5
+```
+
+After editing `.env` run:
+
+```
+docker compose up -d --build policy worker strategist
+```
+
+Quick sanity checks:
+
+```
+# Are forecasts being written?
+docker compose exec -T db bash -lc "psql -U pulse -d pulse -c \"SELECT COUNT(*) FROM forecasts WHERE ts > now() - interval '10 minutes'\""
+
+# Any orders/fills recently?
+docker compose exec -T db bash -lc "psql -U pulse -d pulse -c \"SELECT COUNT(*) FROM fills WHERE ts > now() - interval '30 minutes'\""
+```
+
+If those are still zero, verify data feeds (Alpaca/crypto) are flowing, and ensure your `TRADING_UNIVERSE_VIEW` returns the expected 100 symbols.
+
 ## Accounts to set up
 - Required
   - Alpaca Paper Trading account (free): create keys for `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`.
