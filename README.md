@@ -25,6 +25,43 @@ This monorepo ships a minimal, production-lean trading research stack:
 4) Open API: http://localhost:8001/docs
 5) Prometheus: http://localhost:9090
 
+### After allocator fixes (October 2025)
+- The allocator now treats tiny long/short weights symmetrically (`libs/portfolio/sizer.py`), so lingering fractional shorts are covered instead of ignored and short books use the same normalization logic as longs.
+- Restart the stack after pulling this change so every service reloads the updated sizing logic:
+
+  ```bash
+  docker compose down
+  docker compose up -d
+  docker compose ps
+  ```
+
+  (Expect the GPU Kronos services to report `health: starting` for ~30 seconds before they flip to `healthy`.)
+- Sanity-check policy with `docker compose logs -f policy | grep -i "sizer"` and confirm fills show net BUYs when flattening shorts.
+
+### Short book controls (November 2025)
+
+The live allocator + executor now supports symmetrical long/short books with clamps across positions, sectors, gross exposure, and net exposure. Key knobs (all read from `.env`) are:
+
+| Flag | Purpose |
+| --- | --- |
+| `PT_ALLOW_SHORTS` | Master enable for short routing (set `false` to fall back to long-only behavior). |
+| `PT_MAX_SHORT_POS_PCT`, `PT_MAX_POS_PCT` | Per-symbol caps for shorts/longs (fraction of NAV). |
+| `PT_SECTOR_MAX_SHORT_PCT`, `PT_SECTOR_MAX_PCT` | Sector aggregates per side. |
+| `PT_GROSS_MAX_PCT` | |long| + |short| exposure cap. |
+| `PT_NET_EXPO_MIN` / `PT_NET_EXPO_MAX` | Net exposure band enforced after sector/gross scaling. |
+| `PT_REQUIRE_SHORTABLE` | Requires Alpaca to mark the symbol `shortable` *and* `easy_to_borrow` before opening a short. |
+| `PT_USE_TRAILING_STOPS`, `PT_TRAIL_BUY_TO_COVER_PCT` | Optional trailing buy-to-cover orders after each new short. |
+
+Implementation highlights:
+- `libs/portfolio/allocator.propose_target_weights_long_short` normalizes long and short buckets independently, applies sector/gross caps, and then scales into the requested net-exposure band.
+- `services/policy/policy/run.py` now consumes the long/short map, converts weight deltas to share deltas, and routes:
+  - Positive deltas → buys / buy-to-cover.
+  - Negative deltas → close existing longs first, then (if enabled) short sell the remainder.
+  - Every short entry can optionally attach a trailing buy-to-cover protective order.
+- Short gate uses cached Alpaca asset metadata (`dim_company_profile.shortable`, `.easy_to_borrow`). Run `make ingest-backfill` or the nightly ingest job to refresh the cache.
+
+**Reminder:** run the DB migration `db/migrations/20251105_add_shortability_flags.sql` (already applied in this repo) before starting policy; otherwise `_fetch_fundamentals` will fail.
+
 ## Alpaca end-to-end (paper)
 - In `.env` set:
   - `ENABLE_ALPACA=1` to ingest equities via Alpaca Market Data WS.
@@ -52,6 +89,47 @@ These GPU-ready microservices live alongside the core API. Each reads its artifa
 | `kronos-tft` | 8084 | `/mnt/data/models/kronos-tft/latest` | `/forecast` (multivariate TFT forecasts)
 
 Health checks: `docker compose exec -T <service> curl -fsS http://localhost:<port>/health`
+
+## LLM service (“Lexi” via shared vLLM)
+
+PulseTrade no longer ships an embedded vLLM container. Instead, all services call the shared “Lexi” instance running on the host (port `8008`) via `host.docker.internal`.
+
+- Launch Lexi separately (example):
+
+  ```bash
+  export CUDA_VISIBLE_DEVICES=0,1,2,3
+  /mnt/data/vllm-venv/bin/python -m vllm.entrypoints.openai.api_server \
+    --model /mnt/data/models/Qwen/Qwen2.5-32B-AGI \
+    --served-model-name Lexi \
+    --tensor-parallel-size 4 \
+    --dtype float16 \
+    --max-model-len 4096 \
+    --gpu-memory-utilization 0.88 \
+    --max-num-seqs 64 \
+    --swap-space 12 \
+    --distributed-executor-backend mp \
+    --trust-remote-code \
+    --download-dir /mnt/data/models \
+    --disable-custom-all-reduce \
+    --host 0.0.0.0 --port 8008
+  ```
+
+- Core services expect:
+  - `LLM_BASE_URL=http://host.docker.internal:8008/v1`
+  - `LLM_MODEL=Lexi`
+  - `LLM_API_KEY` left blank (OpenAI-compatible but unauthenticated in this setup)
+- `docker-compose.yml` sets `extra_hosts` for API + Forecast so `host.docker.internal` resolves inside the containers.
+- Health check (proxy through API): `curl -s http://localhost:8001/llm/health`
+- Manual chat: `curl -s -X POST http://localhost:8001/llm/chat -H 'Content-Type: application/json' -d '{"system":"You are terse.","user":"Summarize AAPL earnings in 3 bullets."}'`
+
+Configuration still lives in `.env` / `.env.example`. The forecast service records `llm` metadata (rationales + policy filter output) alongside each stored forecast, and the `/analysis/recent` API endpoint exposes a summary generated on demand.
+
+- Prompt registry: `configs/llm_prompts.yaml` tracks versioned templates. Use `LLM_AB_BUCKETS` to run A/B variants.
+- Audit trail: every call is persisted to `llm_calls` with latency, prompt hash, and success flag. `make migrate-llm` applies the schema.
+- Admin endpoints: `GET /llm/admin/call/{id}`, `POST /llm/admin/replay`, `GET /llm/admin/stats`.
+- Offline eval: `make eval-llm` replays historical snapshots and writes latency/validity stats under `results/`.
+- Kill switch & panic controls: set `ORDER_GATE_DISABLED=true` to bypass LLM gating, and enable `ENABLE_PANIC_EXIT=1` to allow `POST /strategist/panic-exit` to place a global breaker and close open positions.
+- Portfolio allocator knobs: `.env` now exposes `PT_MAX_POS_PCT`, `PT_SECTOR_MAX_PCT`, `PT_GROSS_MAX_PCT`, `PT_CASH_FLOOR_PCT`, `PT_MIN_ORDER_NOTIONAL`, `PT_NO_TRADE_BAND_PCT`, `PT_TOP_N`, `PT_SCORE_FIELD`, `PT_SCORE_EXP`, `PT_TURNOVER_CAP_PCT`, and replacement gates (`PT_ENABLE_REPLACEMENT`, `PT_REPLACEMENT_FRIC_BPS`, `PT_REPLACEMENT_LOOKBACK_D`). These power the new sizing engine (see Kronos doc §7).
 
 ### Tools runner for scripts
 
@@ -143,7 +221,7 @@ If those are still zero, verify data feeds (Alpaca/crypto) are flowing, and ensu
 
     * Until fundamentals are available, TFT will train on zero-filled covariates. Keep it in shadow mode and swap artifacts after the backfill succeeds.
   - Stocktwits token (`STOCKTWITS_TOKEN`) to use their trending API; if absent, a scrape fallback is used for trending symbols.
-  - Quiver/CapitolTrades (`QUIVER_API_KEY`, `CAPITOLTRADES_BASE`) for politics-related trades.
+  - Quiver/CapitolTrades (`QUIVER_API_TOKEN` or `QUIVER_API_KEY`, `QUIVER_API_BASE`, `QUIVER_TIMEOUT`, `QUIVER_ENABLE_PUBLIC_EXTRAS`, `CAPITOLTRADES_BASE`) for congress trading, lobbying, government contracts, off-exchange short volume, and optional public datasets (13F, ETF holdings, app ratings, patents, political beta). Use `make quiver-backfill` for a historical load and schedule `make quiver-update` daily.
   - Truth Social cookie (`TRUTH_SOCIAL_COOKIE`) if you want to pull posts.
 
 ## Feature flags (common)
@@ -164,10 +242,11 @@ If those are still zero, verify data feeds (Alpaca/crypto) are flowing, and ensu
     `PLANNER_ENTRY_ATR_FRAC`, `PLANNER_BRACKET_PRICE_MAX`, `PLANNER_USE_SENTIMENT`, `PLANNER_USE_FUNDAMENTALS`.
   - Throughput: `POLICY_MAX_SUBMITS_PER_STEP`, order/position rate limits `ALPACA_ORDERS_PER_SEC`, `ALPACA_POS_PER_SEC`.
 
-## Notes on execution (Paper Trading)
+## Notes on execution (paper + live)
 - IEX feed is available on free plans; SIP requires upgrading the Alpaca Market Data subscription and signing exchange agreements.
 - Fractional brackets are not allowed by Alpaca; we place simple limit orders for fractional qty and brackets only for whole-share orders.
-- Shorting fractional qty is not allowed; baseline/planner will skip those submits and record a `SIM` decision for audit.
+- Short entries obey the shortability cache and per-name clamps; if a symbol is not ETB (or currently cooling down due to rejection), the short leg is skipped and logged.
+- Shorting fractional qty is not allowed; delta shares are rounded to whole integers before routing.
 
 ## What you’ll see
 - Ingestion will continuously populate `trades` from crypto (Coinbase/Kraken), equities (Alpaca IEX WS + REST fallback), and optional providers.

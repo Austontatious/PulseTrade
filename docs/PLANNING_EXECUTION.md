@@ -43,8 +43,23 @@ This document explains how the live planning and execution pipeline works in Pul
 6) Top‑K and cool‑down
    - Planner considers only the top `PLANNER_TOP_K` symbols per step and enforces a per‐symbol cool‐down (e.g., 30 min) to reduce churn.
 
+## Allocator (long + short)
+- Inputs: latest `Idea` objects from forecasts, live prices, sectors, and existing weights.
+- Normalization: longs and shorts are split by score sign, raised to `PT_SCORE_EXP`, and normalized independently.
+- Caps enforced (per `.env`):
+  - Per symbol (`PT_MAX_POS_PCT`, `PT_MAX_SHORT_POS_PCT`).
+  - Per sector (`PT_SECTOR_MAX_PCT`, `PT_SECTOR_MAX_SHORT_PCT`).
+  - Gross (`PT_GROSS_MAX_PCT`) and net band (`[PT_NET_EXPO_MIN, PT_NET_EXPO_MAX]`).
+- Output: dictionary `{symbol: target_weight}`, positive = long, negative = short.
+- Cash floor (`PT_CASH_FLOOR_PCT`) carved out before gross allocation, reused by replacement logic.
+
 ## Sizing
-- Vol‐targeted sizing (default):
+- Weight delta → shares:
+  - `delta_weight = target_weight - cur_weight`
+  - `notional = delta_weight × NAV`
+  - `shares = round(notional / price)`
+  - Skips trades inside `PT_NO_TRADE_BAND_PCT` or below `PT_MIN_ORDER_NOTIONAL`.
+- Vol-targeted sizing (planner path):
   - `qty = RISK_DOLLARS_PER_TRADE / ATR`, so a 1×ATR stop size ≈ fixed dollar risk.
 - Fallback notional sizing: `qty = LIMIT_NOTIONAL / entry`.
 
@@ -61,9 +76,17 @@ This document explains how the live planning and execution pipeline works in Pul
   - Dedupe: checks open orders before posting.
 
 ## Baseline policy orders
-- Market buys allowed broadly (subject to spread/age guard and circuit breakers).
-- Sells are “close only”: capped to current Alpaca position (avoids shorts) with a tiny epsilon to handle precision.
-- Order/position rate limits enforce API friendliness.
+- Market buys are allowed broadly (subject to spread/age guard and breakers).
+- Sells behave differently depending on the allocator output:
+  - When `target_weight < cur_weight ≤ 0` (flattening longs), the policy caps the sell qty to the current shares (close-only).
+  - When `target_weight < 0` (new short):
+    - Close any existing long inventory first.
+    - Check shortability cache (`dim_company_profile.shortable`, `.easy_to_borrow`); optionally refresh via Alpaca assets API if cache is stale.
+    - Respect per-symbol cooldowns when a short reject occurs (default 10 minutes).
+    - If allowed, place a market short-sell order via Alpaca.
+    - Optionally attach a trailing buy-to-cover order (`PT_USE_TRAILING_STOPS`, `PT_TRAIL_BUY_TO_COVER_PCT`).
+- Buys always attempt to buy-to-cover existing shorts before adding net long exposure (the policy differentiates buy-to-cover vs. fresh long by inspecting current shares).
+- Order/position rate limits (`ALPACA_ORDERS_PER_SEC`, `ALPACA_POS_PER_SEC`) enforce API friendliness.
 
 ## Circuit breakers
 Tables: `circuit_breakers(scope, key, active, expires_at, meta)`.
@@ -100,4 +123,3 @@ Action: Insert an active `('global','ALL')` breaker with TTL (e.g., 60m). Policy
 3) Build planner universe → z‑gate, sentiment/fundamental gates → spread/age guard → limit entries with bracket if allowed.
 4) Exit manager posts TP/SL for fractional entries without brackets.
 5) Symbol breaker evaluation; global breaker escalation if many symbols trip.
-
