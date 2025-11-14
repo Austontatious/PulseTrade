@@ -92,21 +92,21 @@ async def submit_order(
         # Alpaca requires qty for limit orders; notional is not supported for limit
         if qty is None or limit_price is None:
             raise ValueError("limit orders require qty and limit_price")
-        payload["qty"] = qty
+        payload["qty"] = str(qty)
         payload["limit_price"] = float(limit_price)
     elif otype == "stop":
         if qty is None or stop_price is None:
             raise ValueError("stop orders require qty and stop_price")
-        payload["qty"] = qty
+        payload["qty"] = str(qty)
         payload["stop_price"] = float(stop_price)
     else:
-        # Market order: prefer notional when configured
-        if notional is not None:
+        # Market order: prefer caller-provided qty if available, otherwise fall back to notional.
+        if qty is not None:
+            payload["qty"] = str(qty)
+        elif notional is not None:
             payload["notional"] = float(notional)
         elif ALPACA_NOTIONAL and ALPACA_NOTIONAL.strip() and float(ALPACA_NOTIONAL) > 0:
             payload["notional"] = float(ALPACA_NOTIONAL)
-        elif qty is not None:
-            payload["qty"] = qty
         else:
             raise ValueError("market orders require qty or notional")
     if order_class:
@@ -126,10 +126,20 @@ async def submit_order(
     }
     await _acquire('ord')
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.post(url, json=payload, headers=headers)
+        try:
+            resp = await client.post(url, json=payload, headers=headers)
+        except Exception as exc:
+            print("alpaca submit error:", exc)
+            raise
         if resp.status_code >= 400:
             try:
-                print("alpaca order error:", resp.status_code, resp.text)
+                print("alpaca order error:", resp.status_code, resp.text, flush=True)
+                try:
+                    body = resp.request.content.decode() if resp.request.content else ""
+                except Exception:
+                    body = "<unable to decode>"
+                print("alpaca order payload:", payload, flush=True)
+                print("alpaca order serialized:", body, flush=True)
             except Exception:
                 pass
             resp.raise_for_status()
@@ -161,6 +171,92 @@ async def get_position_qty(symbol: str) -> float:
             return float(qty_str)
         except Exception:
             return 0.0
+
+async def get_all_positions() -> List[Dict[str, Any]]:
+    """Fetch all open positions from Alpaca Paper API.
+
+    Returns an empty list if credentials are missing or request fails.
+    """
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        return []
+    base = (ALPACA_BASE or "https://paper-api.alpaca.markets").rstrip("/")
+    url = f"{base}/v2/positions"
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    await _acquire('pos')
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code >= 400:
+                try:
+                    print("alpaca positions list error:", resp.status_code, resp.text)
+                except Exception:
+                    pass
+                return []
+            data = resp.json()
+            if isinstance(data, list):
+                return data  # type: ignore[return-value]
+            return []
+        except Exception:
+            return []
+
+async def close_position(symbol: str) -> Optional[Dict[str, Any]]:
+    """Close the entire position for the given symbol via Alpaca.
+
+    Uses DELETE /v2/positions/{symbol}. Returns response JSON or None on failure.
+    """
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        return None
+    base = (ALPACA_BASE or "https://paper-api.alpaca.markets").rstrip("/")
+    url = f"{base}/v2/positions/{symbol}"
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    await _acquire('pos')
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.delete(url, headers=headers)
+            if resp.status_code >= 400:
+                try:
+                    print("alpaca close position error:", resp.status_code, resp.text)
+                except Exception:
+                    pass
+                return None
+            try:
+                return resp.json()
+            except Exception:
+                return {}
+        except Exception:
+            return None
+
+
+async def get_account() -> Dict[str, Any]:
+    """Fetch Alpaca account snapshot."""
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        return {}
+    base = (ALPACA_BASE or "https://paper-api.alpaca.markets").rstrip("/")
+    url = f"{base}/v2/account"
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    await _acquire('ord')
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code >= 400:
+                try:
+                    print("alpaca account error:", resp.status_code, resp.text)
+                except Exception:
+                    pass
+                return {}
+            data = resp.json()
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
 
 # Open orders (dedupe)
 _open_cache: Dict[str, Dict[str, float]] = {}
@@ -230,17 +326,22 @@ async def maybe_submit_order(
     stop_loss_stop: Optional[float] = None,
     stop_loss_limit: Optional[float] = None,
     stop_price: Optional[float] = None,
+    use_notional_for_market: bool = True,
 ) -> Optional[dict]:
     if not ALPACA_ENABLED or not ALPACA_KEY or not ALPACA_SECRET:
         return None
     try:
+        # For market orders, allow callers to bypass notional usage and force qty sizing
         return await submit_order(
             symbol,
             side,
             qty,
             order_type=order_type or ALPACA_ORDER_TYPE,
             time_in_force=ALPACA_TIF,
-            notional=None if (order_type or ALPACA_ORDER_TYPE).lower() == "limit" else (float(ALPACA_NOTIONAL) if ALPACA_NOTIONAL else None),
+            notional=(
+                None if (order_type or ALPACA_ORDER_TYPE).lower() == "limit"
+                else (float(ALPACA_NOTIONAL) if (use_notional_for_market and ALPACA_NOTIONAL) else None)
+            ),
             limit_price=limit_price,
             order_class=order_class,
             take_profit_limit=take_profit_limit,

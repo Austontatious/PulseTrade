@@ -1,4 +1,4 @@
-.PHONY: models.fetch build up down logs api test fmt lint type data.fetch data.compile data.validate train.nbeats scenarios.train scenarios.bundle scenarios.up graphx.train graphx.bundle graphx.up
+.PHONY: models.fetch build up down logs api test fmt lint type data.fetch data.compile data.validate train.nbeats train-nbeats train-tft train-chronos scenarios.train scenarios.bundle scenarios.up graphx.train graphx.bundle graphx.up llm-up llm-logs llm-restart test-llm migrate-llm eval-llm quiver-backfill quiver-update quiver-backfill-tier1 quiver-update-tier1 ingest-backfill
 
 models.fetch:
 	@mkdir -p /mnt/data/models
@@ -39,6 +39,15 @@ logs:
 	docker compose --compatibility logs -f kronos-nbeats kronos-graph
 api:
 	curl -s http://localhost:8001/health && echo
+
+llm-up:
+	docker compose up -d llm
+
+llm-logs:
+	docker compose logs -f llm
+
+llm-restart:
+	docker compose restart llm
 fmt:
 	ruff check --fix .
 lint:
@@ -47,6 +56,27 @@ type:
 	mypy services libs
 test:
 	pytest -q
+
+test-llm:
+	pytest -q tests/test_llm_client.py tests/test_llm_policy.py
+
+migrate-llm:
+	docker compose exec -T db psql -U pulse -d pulse -f db/migrations/20251027_add_llm_tables.sql
+
+eval-llm:
+	docker compose run --rm tools bash -lc 'python tools/llm_eval/run_eval.py'
+
+quiver-backfill:
+	docker compose run --rm ingest bash -lc 'python -m ingest.run quiver_backfill'
+
+quiver-update:
+	docker compose run --rm ingest bash -lc 'python -m ingest.run quiver_update'
+
+quiver-backfill-tier1:
+	docker compose run --rm ingest bash -lc 'python -m ingest.run quiver_backfill'
+
+quiver-update-tier1:
+	docker compose run --rm ingest bash -lc 'python -m ingest.run quiver_update'
 
 data.fetch:
 	python3 tools/kronos_data/fetch_datasets.py
@@ -78,6 +108,18 @@ graphx.bundle:
 
 graphx.up:
 	docker compose up -d --build kronos-graphx
+
+.PHONY: ingest-backfill
+ingest-backfill:
+	docker compose run --rm ingest bash -lc 'PYTHONPATH=/app:/app/libs python -m ingest.alpaca_rest backfill'
+
+train-nbeats: train.nbeats
+
+train-tft: tft.train
+
+.PHONY: train-chronos
+train-chronos:
+	@echo "Chronos training pipeline not implemented; skip."
 
 .PHONY: fmp.backfill
 fmp.backfill:

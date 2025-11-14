@@ -1,8 +1,10 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import random
+from datetime import datetime, timezone
 from functools import partial
 from typing import Any, Dict, List
 
@@ -10,6 +12,7 @@ import asyncpg
 import pandas as pd
 
 from libs.kronos_client.client import ForecastClient
+from .llm_hooks import generate_rationale, policy_filter, _fetch_quiver_summary
 
 from .model_swap import Model
 
@@ -33,6 +36,8 @@ HORIZON = "1m"
 MODEL = Model()
 MODEL_NAME = MODEL.__class__.__name__
 logger = logging.getLogger(__name__)
+POLICY_MIN_LIQUIDITY = float(os.getenv("LLM_POLICY_MIN_LIQUIDITY", "2000000"))
+MACRO_REGIME = os.getenv("MACRO_REGIME", "neutral")
 
 
 def _build_series_for_kronos(series: pd.Series) -> List[float]:
@@ -82,6 +87,156 @@ async def load_covariates(conn: asyncpg.Connection, ticker: str) -> Dict[str, An
     ]
     return {"social": social_features}
 
+
+async def _recent_headlines(conn: asyncpg.Connection, ticker: str, limit: int = 5) -> List[str]:
+    rows = await conn.fetch(
+        """SELECT text FROM social_messages
+            WHERE ticker=$1 AND text IS NOT NULL
+            ORDER BY ts DESC
+            LIMIT $2""",
+        ticker,
+        limit,
+    )
+    return [r["text"] for r in rows]
+
+
+async def _next_earnings(conn: asyncpg.Connection, ticker: str) -> str:
+    row = await conn.fetchrow(
+        """SELECT start_ts FROM event_windows
+            WHERE ticker=$1 AND kind='earnings' AND start_ts > NOW()
+            ORDER BY start_ts ASC
+            LIMIT 1""",
+        ticker,
+    )
+    if not row:
+        return "none"
+    return row["start_ts"].date().isoformat()
+
+
+async def _estimate_liquidity(conn: asyncpg.Connection, ticker: str) -> float:
+    row = await conn.fetchrow(
+        """SELECT SUM(price * COALESCE(size, 0)) AS notional
+            FROM trades
+            WHERE ticker=$1 AND ts > NOW() - INTERVAL '1 day'""",
+        ticker,
+    )
+    return float(row["notional"] or 0.0)
+
+
+def _extract_factors(covariates: Dict[str, Any]) -> Dict[str, float]:
+    social = covariates.get("social") or []
+    if not social:
+        return {}
+    latest = social[0]
+    factors: Dict[str, float] = {}
+    for key in ("rate", "senti_mean", "senti_std"):
+        value = latest.get(key)
+        if value is not None:
+            factors[key] = float(value)
+    return factors
+
+
+def _coverage_pct(covariates: Dict[str, Any]) -> float:
+    social = covariates.get("social") or []
+    if not social:
+        return 0.0
+    latest = social[0]
+    total = len(latest)
+    filled = sum(1 for v in latest.values() if v not in (None, ""))
+    if total == 0:
+        return 0.0
+    return filled / total
+
+
+async def _attach_llm_context(
+    conn: asyncpg.Connection,
+    ticker: str,
+    signal_value: float,
+    signal_label: str,
+    covariates: Dict[str, Any],
+) -> Dict[str, Any]:
+    as_of = datetime.now(timezone.utc).isoformat()
+    factors = _extract_factors(covariates)
+    factor_dispersion = max((abs(v) for v in factors.values()), default=0.0)
+    coverage_pct = _coverage_pct(covariates)
+
+    headlines = await _recent_headlines(conn, ticker)
+    earnings_date = await _next_earnings(conn, ticker)
+    liquidity = await _estimate_liquidity(conn, ticker)
+    quiver_summary = await _fetch_quiver_summary(conn, ticker)
+    quiver_bullets = quiver_summary.get("bullets", [])
+    headline_items = list(headlines) + quiver_bullets
+
+    llm_meta: Dict[str, Any] = {"rationale": None, "policy": None}
+    try:
+        rationale_task = asyncio.create_task(
+            generate_rationale(
+                ticker=ticker,
+                as_of=as_of,
+                signal_value=signal_value,
+                signal_label=signal_label,
+                factors=factors,
+                headlines=headline_items,
+            )
+        )
+        policy_task = asyncio.create_task(
+            policy_filter(
+                ticker=ticker,
+                as_of=as_of,
+                earnings_date=earnings_date,
+                liquidity_usd=liquidity,
+                borrow_ok=True,
+                factor_dispersion=factor_dispersion,
+                coverage_pct=coverage_pct,
+                macro_regime=MACRO_REGIME,
+                signal_label=signal_label,
+                signal_value=signal_value,
+                min_liquidity=POLICY_MIN_LIQUIDITY,
+                extra_inputs=quiver_summary.get("policy_flags"),
+            )
+        )
+        rationale, policy = await asyncio.gather(rationale_task, policy_task)
+        llm_meta["rationale"] = {
+            "text": rationale.get("text"),
+            "cached": rationale.get("cached", False),
+            "prompt_key": rationale.get("prompt_key"),
+            "prompt_version": rationale.get("prompt_version"),
+            "prompt_hash": rationale.get("prompt_hash"),
+        }
+        decision = policy.get("json") or {}
+        llm_meta["policy"] = {
+            "raw": policy.get("text"),
+            "decision": decision,
+            "cached": policy.get("cached", False),
+            "prompt_key": policy.get("prompt_key"),
+            "prompt_version": policy.get("prompt_version"),
+            "prompt_hash": policy.get("prompt_hash"),
+            "success": policy.get("success", True),
+            "error": policy.get("error"),
+            "shadow_mode": policy.get("shadow", False),
+            "shadow_allow": decision.get("allow") if policy.get("shadow") else None,
+            "shadow_flags": decision.get("flags") if policy.get("shadow") else None,
+            "extra_inputs": policy.get("extra_inputs", {}),
+        }
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        llm_meta["error"] = str(exc)
+
+    llm_meta.update(
+        {
+            "inputs": {
+                "as_of": as_of,
+                "headlines": headline_items,
+                "earnings": earnings_date,
+                "liquidity": liquidity,
+                "factor_dispersion": factor_dispersion,
+                "coverage_pct": coverage_pct,
+                "quiver": quiver_summary.get("aggregates", {}),
+            }
+        }
+    )
+    llm_meta["quiver"] = quiver_summary
+    return llm_meta
+
 async def forecast_once(conn, ticker: str):
     q = """SELECT ts, price FROM trades WHERE ticker=$1 AND ts > NOW() - INTERVAL '10 minutes' ORDER BY ts ASC"""
     rows = await conn.fetch(q, ticker)
@@ -90,6 +245,7 @@ async def forecast_once(conn, ticker: str):
     s = pd.Series([r["price"] for r in rows], index=[r["ts"] for r in rows])
     covariates = await load_covariates(conn, ticker)
     kronos_bundle = await _fetch_kronos_bundle(ticker, s)
+    factors = _extract_factors(covariates)
     feature_snapshot = {
         "social": [
             {
@@ -101,11 +257,54 @@ async def forecast_once(conn, ticker: str):
             for item in covariates.get("social", [])
         ],
         "kronos": kronos_bundle,
+        "factors": factors,
     }
-    mean, lower, upper = MODEL.predict(s, covariates=covariates)
+    latest_price = float(s.iloc[-1])
+    mean: float | None = None
+    lower: float | None = None
+    upper: float | None = None
+    model_name = MODEL_NAME
+    kronos_used = False
+
+    if kronos_bundle.get("status") == "ok":
+        horizon_key = str(KRONOS_HORIZON[0])
+        yhat = kronos_bundle.get("yhat") or {}
+        quantiles = kronos_bundle.get("q") or {}
+        meta = kronos_bundle.get("meta") or {}
+
+        def _as_price(ret: float | None) -> float | None:
+            if ret is None:
+                return None
+            try:
+                return latest_price * math.exp(float(ret))
+            except Exception:
+                return None
+
+        mean = _as_price(yhat.get(horizon_key))
+        quantile_row = quantiles.get(horizon_key) or {}
+        p05 = _as_price(quantile_row.get("p05"))
+        p50 = _as_price(quantile_row.get("p50"))
+        p95 = _as_price(quantile_row.get("p95"))
+        lower = p05 or p50
+        upper = p95 or p50
+        if lower and upper and lower > upper:
+            lower, upper = upper, lower
+        model_name = str(meta.get("model") or "kronos-nbeats")
+        kronos_used = mean is not None and lower is not None and upper is not None
+
+    if not kronos_used:
+        mean, lower, upper = MODEL.predict(s, covariates=covariates)
+        kronos_used = False
+        model_name = MODEL_NAME
+
+    signal_label = "BUY" if (mean or latest_price) >= latest_price else "SELL"
+    llm_meta = await _attach_llm_context(conn, ticker, float(mean or 0.0), signal_label, covariates)
+    feature_snapshot["llm"] = llm_meta
+    feature_snapshot.setdefault("kronos", kronos_bundle)
+    feature_snapshot["kronos"]["used_for_forecast"] = kronos_used
     await conn.execute("""INSERT INTO forecasts(ts,ticker,horizon,model,mean,lower,upper,features)
                           VALUES(NOW(), $1, $2, $3, $4, $5, $6, $7)""",
-                       ticker, HORIZON, MODEL_NAME, mean, lower, upper, json.dumps(feature_snapshot))
+                       ticker, HORIZON, model_name, mean, lower, upper, json.dumps(feature_snapshot))
 
 async def main():
     logging.basicConfig(level=logging.INFO)

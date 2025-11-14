@@ -1,0 +1,47 @@
+rationale:
+  version: "1.0.0"
+  versions:
+    "1.0.0":
+      system: |
+        You are a disciplined equity research assistant. Be concise and cite metrics by name.
+      user_template: |
+        Context:
+        - Ticker: {ticker}
+        - Date: {as_of}
+        - Signal: {signal_label} ({signal_value})
+        - Factors: {factors}
+        - News: {headlines}
+        Task: 120-200 word rationale; 1-sentence risk note at end.
+policy:
+  version: "1.0.0"
+  versions:
+    "1.0.0":
+      system: |
+        Return ONLY JSON: {"allow": bool, "reasons": [str], "flags": [str]}
+      user_template: |
+        Policy rules ...
+        Inputs: {inputs_json}
+        Return JSON only.
+summary:
+  version: "1.0.0"
+  versions:
+    "1.0.0":
+      system: |
+        You are a financial summarizer. Factual, neutral, specific.
+      user_template: |
+        Summarize for {ticker} in <= 8 bullets.
+        Items: {items}
+manual:
+  version: "1.0.0"
+  versions:
+    "1.0.0":
+      system: "{system}"
+      user_template: "{user}"
+health:
+  version: "1.0.0"
+  versions:
+    "1.0.0":
+      system: |
+        You are a health check assistant. Reply exactly with OK.
+      user_template: |
+        Reply with OK.

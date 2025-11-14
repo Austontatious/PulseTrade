@@ -122,3 +122,17 @@ PyTorch Geometric wheels are CUDA-specific; if `pip install torch-geometric` fai
 - Daily job (`tools/kronos_data/update_calibration.py`) pulls forecasts vs. realized returns, updates EWMA bias/interval states, and writes `/mnt/data/kronos_state/calibration.parquet`.
 - Service reads the file (via `/state` mount) and applies a light bias + interval scaling per symbol. Disable by setting `KRONOS_CALIBRATION_ENABLED=0`.
 - Suggested scheduler (cron): `0 18 * * 1-5 PYTHONPATH=/mnt/data/PulseTrade DATABASE_URL=<...> python3 /mnt/data/PulseTrade/tools/kronos_data/update_calibration.py`.
+
+## Strategy Evaluation Scorecard
+
+- Nightly job (`tools/kronos_eval/daily_strategy_eval.py`) joins Planner/allocator fills with Kronos forecasts, strategist recommendations, `daily_returns`, SPY/sector ETF baselines, and the current `risk_regime` knob to answer “does the *strategy* have edge?” instead of just “does the model look calibrated?”.
+- Outputs:
+  - Per-trade detail parquet/CSV under `reports/` with realized r\_hold/r\_1d/r\_3d, edge vs SPY and sector, PT\_SCORE bucket, regime, and forecast hit-rate flags.
+  - Bucketed summary CSV (`reports/kronos_strategy_eval_YYYY-MM-DD.csv`) with win rate, mean/median return, edge vs SPY/sector, and hit-rates by signal strength, PT score deciles, regime, and side.
+  - Markdown summary (`reports/kronos_strategy_eval_YYYY-MM-DD.md`) suitable for daily check-ins.
+- Recommended host-side wrapper: `scripts/nightly_strategy_eval.sh` (runs the job inside the `tools` container and logs to `/mnt/data/logs/strategy_eval/`).
+- Example cron entry (adjust time as needed, typically after the nightly tuner/calibration jobs):
+
+  ```cron
+  30 2 * * * /mnt/data/PulseTrade/scripts/nightly_strategy_eval.sh >> /mnt/data/logs/strategy_eval/cron.log 2>&1
+  ```

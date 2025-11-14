@@ -226,6 +226,8 @@ async def plan_limit_order(conn: asyncpg.Connection, ticker: str) -> Optional[di
         qty = max(risk_dollars/max(atr, 1e-6), 0.0001)
     else:
         qty = max(LIMIT_NOTIONAL/max(entry, 1e-6), 0.0001)
+    # Bracket only allowed for whole-share quantities and reasonable price
+    is_whole_qty = abs(qty - round(qty)) < 1e-6 and round(qty) >= 1
     plan = {
         "ticker": ticker,
         "side": side,
@@ -235,6 +237,6 @@ async def plan_limit_order(conn: asyncpg.Connection, ticker: str) -> Optional[di
         "target": round(target, 2),
         "atr": round(atr, 6),
         "dev": dev,
-        "bracket_ok": (qty >= 1.0 and entry <= BRACKET_PRICE_MAX),
+        "bracket_ok": (is_whole_qty and entry <= BRACKET_PRICE_MAX),
     }
     return plan

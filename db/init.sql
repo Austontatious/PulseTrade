@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS dim_company_profile (
   sector TEXT,
   industry TEXT,
   country TEXT,
+  shortable BOOLEAN,
+  easy_to_borrow BOOLEAN,
   meta JSONB DEFAULT '{}'::jsonb
 );
 
@@ -66,6 +68,19 @@ CREATE TABLE IF NOT EXISTS social_features (
   PRIMARY KEY (ts, ticker, window_minutes)
 );
 SELECT create_hypertable('social_features','ts', if_not_exists => TRUE);
+
+CREATE TABLE IF NOT EXISTS ingest_metrics (
+  id BIGSERIAL PRIMARY KEY,
+  symbol TEXT NOT NULL,
+  as_of DATE NOT NULL,
+  metric TEXT NOT NULL,
+  value DOUBLE PRECISION NOT NULL,
+  window TEXT NOT NULL,
+  src TEXT NOT NULL,
+  raw JSONB,
+  UNIQUE(symbol, as_of, metric, window, src)
+);
+CREATE INDEX IF NOT EXISTS ingest_metrics_idx ON ingest_metrics (symbol, as_of, metric);
 
 -- Analyst ratings / targets
 CREATE TABLE IF NOT EXISTS analyst_ratings (
@@ -155,6 +170,30 @@ CREATE TABLE IF NOT EXISTS circuit_breakers (
   expires_at TIMESTAMPTZ,
   meta JSONB DEFAULT '{}'::jsonb
 );
+
+CREATE TABLE IF NOT EXISTS llm_calls (
+  id BIGSERIAL PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  prompt_key TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  prompt_hash TEXT NOT NULL,
+  input_payload JSONB NOT NULL,
+  output_text TEXT,
+  output_json JSONB,
+  model TEXT NOT NULL,
+  temperature REAL NOT NULL,
+  top_p REAL NOT NULL,
+  max_output_tokens INT NOT NULL,
+  latency_ms INT,
+  tokens_prompt INT,
+  tokens_output INT,
+  success BOOLEAN NOT NULL DEFAULT FALSE,
+  error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS llm_calls_prompt_idx ON llm_calls (prompt_key, prompt_version);
+CREATE INDEX IF NOT EXISTS llm_calls_hash_idx ON llm_calls (prompt_hash);
+CREATE INDEX IF NOT EXISTS llm_calls_ts_idx ON llm_calls (ts);
 
 -- Strategist: recommendations and policy knobs
 CREATE TABLE IF NOT EXISTS strategist_recos (

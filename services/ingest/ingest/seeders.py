@@ -6,6 +6,7 @@ import httpx
 from bs4 import BeautifulSoup
 import re
 from .config import DB_DSN
+from .collectors.alpaca_assets import refresh_shortable_flags
 
 WIKI_SNP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 WIKI_NDX100 = "https://en.wikipedia.org/wiki/Nasdaq-100"
@@ -96,5 +97,11 @@ async def run_universe_seeders():
             )
         finally:
             await conn.close()
+        try:
+            updated = await refresh_shortable_flags()
+            if updated:
+                print(f"alpaca shortable cache updated for {updated} symbols")
+        except Exception as exc:  # pragma: no cover
+            print("shortable refresh error:", exc)
     except Exception as e:  # pragma: no cover
         print("universe seeding error:", e)

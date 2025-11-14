@@ -7,8 +7,8 @@ This monorepo ships a minimal, production-lean trading research stack:
 - **Ingestion**: crypto price websockets (Coinbase, Kraken) + stubs for Alpaca, Finnhub, FMP, Stocktwits, Truth Social, QuiverQuant/CapitolTrades
 - **Storage**: Postgres + TimescaleDB
 - **Processing**: Celery workers (Redis broker), feature builders, rate-limit guards, Prometheus metrics
-- **Forecast**: pluggable model engine (baseline moving-average -> swap in Chronos/TimesFM)
-- **Kronos modeling services**: multivariate research stack (N-BEATS, diffusion scenarios, graph attention, TFT) with REST endpoints
+- **Forecast**: Kronos N-BEATS service (via `services/forecast`, falls back to a moving-average only if Kronos is offline)
+- **Kronos modeling services**: multivariate research stack (N-BEATS, TFT, graph, diffusion scenarios) with REST endpoints; see `docs/Kronos_Models_Training_and_Datastreams.md` and `Kronos_Predictive_Stack.md` for model, training, and datastream details.
 - **Policy**: simple position sizing (baseline) -> slot in FinRL later
 - **API**: FastAPI for signals, features, and status
 - **Observability**: Prometheus + basic Grafana starter
@@ -141,6 +141,25 @@ docker compose run --rm tools bash -lc 'python tools/kronos_tft/build_dataset.py
 ```
 
 The service inherits `DATABASE_URL` and any extra vars you pass via `-e`.
+
+### Daily strategy scorecard
+
+The `tools/kronos_eval/daily_strategy_eval.py` job stitches together fills ↔ forecasts ↔ strategist recos and reports whether the *strategy* (not just the model) has edge. Run it inside the `tools` container so it can hit Postgres:
+
+```bash
+docker compose run --rm tools \
+  bash -lc 'python tools/kronos_eval/daily_strategy_eval.py --date $(date -d "yesterday" +%F)'
+```
+
+What it does:
+
+- Rebuilds entry lots per symbol (long and short) so partial exits roll up cleanly and Kronos forecasts are aligned to the exact fill timestamp.
+- Joins strategist score / factors, dim_company_profile sectors, and the most recent risk regime knob.
+- Pulls `daily_returns` (log returns) for the trade symbols, SPY, and each sector ETF proxy to compute r_hold / r\_1d / r\_3d plus edge vs SPY and edge vs sector.
+- Buckets trades by signal strength (|Kronos dev| bps), PT score quintile, regime, and side; emits win rate, mean/median returns, and forecast hit rate per bucket.
+- Writes a CSV summary (`reports/kronos_strategy_eval_YYYY-MM-DD.csv`), a Markdown blurb with the headline takeaways, and a `_trades.parquet` (CSV fallback) containing the per-trade analytics so you can slice further in a notebook.
+
+Drop it on a nightly cron after fills land; the Markdown statement is designed to paste directly into daily check-ins (“Top 20% PT\_SCORE ideas carried +0.8% edge vs SPY; longs lagged shorts in risk-off regime”, etc.).
 
 ### Trading universes
 

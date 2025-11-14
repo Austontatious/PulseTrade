@@ -1,0 +1,26 @@
+services:
+  kronos-nbeats:
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=7
+
+  kronos-graph:
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=7
+
+  kronos-scenarios:
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=7
+
+  kronos-graphx:
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=7
+
+  kronos-tft:
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=7
+
+  strategist:
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${STRATEGIST_GPU:-7}

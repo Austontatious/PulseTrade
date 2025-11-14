@@ -82,6 +82,53 @@ async def _load_symbols(conn: asyncpg.Connection) -> list[str]:
             clean.append(s2)
     return list(dict.fromkeys(clean))
 
+async def backfill_once(feeds: List[str] | None = None, max_symbols: int | None = None) -> int:
+    if not API_KEY or not API_SECRET:
+        return 0
+    feeds_to_use = list(feeds) if feeds else []
+    if not feeds_to_use:
+        if os.getenv("ENABLE_ALPACA_IEX_REST", "1") == "1":
+            feeds_to_use.append("iex")
+        if os.getenv("ENABLE_ALPACA_SIP_REST", "0") == "1":
+            feeds_to_use.append("sip")
+    if not feeds_to_use:
+        return 0
+    conn = await asyncpg.connect(dsn=DB_DSN)
+    inserted = 0
+    try:
+        symbols = await _load_symbols(conn)
+        if max_symbols:
+            symbols = symbols[:max_symbols]
+        async with httpx.AsyncClient() as client:
+            for feed in feeds_to_use:
+                for sym in symbols:
+                    try:
+                        ts, price = await _fetch_latest(sym, feed, client)
+                        if ts and price:
+                            await conn.execute(
+                                "INSERT INTO trades(ts,ticker,price,size,venue,meta) VALUES($1,$2,$3,$4,$5,$6)",
+                                ts,
+                                sym,
+                                price,
+                                None,
+                                f"ALPACA_REST_{feed.upper()}",
+                                None,
+                            )
+                            inserted += 1
+                    except Exception as exc:
+                        print("alpaca REST backfill error:", sym, feed, exc)
+    finally:
+        await conn.close()
+    return inserted
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "backfill":
+        total = asyncio.run(backfill_once())
+        print(f"alpaca REST backfill inserted {total} rows")
+
 async def run_alpaca_rest_poller() -> None:
     if not API_KEY or not API_SECRET:
         print("alpaca REST disabled (missing keys)")

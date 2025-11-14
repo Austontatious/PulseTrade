@@ -13,9 +13,15 @@ Current components
 - N‑BEATS (Neural Basis Expansion Analysis for Time Series)
   - Purpose: medium‑horizon equity return forecasting (1–5 days)
   - Impl: `services/kronos-nbeats` FastAPI container (GPU‑ready) serving quantile forecasts.
+- Temporal Fusion Transformer (TFT)
+  - Purpose: covariate‑aware equity return forecasting that conditions on fundamentals, liquidity, and news/sentiment side channels.
+  - Impl: `services/kronos-tft` FastAPI container loading a pretrained NeuralForecast TFT artifact from `/models/kronos-tft`.
 - Graph/Spatiotemporal Models (StemGNN / PyG‑Temporal)
   - Purpose: cross‑asset dependency and sector propagation modeling
   - Impl: `services/kronos-graph` (scaffolded), `services/kronos-graphx` (artifact runner)
+- Diffusion Scenario Generator
+  - Purpose: multi‑asset return‑path sampling for tail‑risk, stress testing, and “what‑if” scenarios.
+  - Impl: `services/kronos-scenarios` FastAPI container using `libs/kronos_scenarios.student_diffusion.StudentDiffusionDecoder` artifacts under `/models/kronos-scenarios`.
 - S4 / State‑Space Encoder (planned)
   - Purpose: long‑context memory for regime & volatility clustering
 - Online Calibrator
@@ -24,6 +30,9 @@ Current components
 - Fail‑Safe Controller
   - Purpose: detect statistically unexplainable anomalies and trip circuit breakers
   - Impl: risk layer in PulseTrade policy; includes symbol/sector/global breakers and headline‑risk breaker
+ - LLM Policy / Explainability Layer
+   - Purpose: turn numerical forecasts, fundamentals, and alternative‑data flows into natural‑language rationales and structured allow/deny flags that can gate orders.
+   - Impl: host‑side vLLM server (“Lexi”) accessed via `libs.llm.run_and_log.LLMRunner` from `services/forecast/forecast/llm_hooks.py`; outputs land in `forecasts.features->'llm'` and feed the allocator when `PT_BLOCK_IF_LLM_DENY=true`.
 
 2. Data Architecture and Training Sources
 ----------------------------------------
@@ -53,6 +62,13 @@ Current components
 - `strategist_recos` (ranked buy/sell recommendations with factor contributions)
 - `policy_knobs` (dynamic policy tuning and regime switch)
 - `fills`, `positions`, `circuit_breakers` for execution telemetry and controls
+
+2.5 Alternative Data & Political / Flow Signals
+- QuiverQuant, CapitolTrades, and related collectors (`services/ingest/ingest/collectors/quiver_*.py`, `capitoltrades.py`) write aggregated flows into a single `ingest_metrics` fact table keyed by (`symbol`, `metric`, `as_of`).
+- Canonical metric keys include: `quiver_congress_net_usd`, `quiver_insider_net_usd`, `quiver_house_net_usd`, `quiver_senate_net_usd`, `quiver_lobbying_spend_usd`, `quiver_gov_award_usd`, `quiver_app_rating`, `quiver_app_reviews`, `quiver_etf_weight_pct`, `quiver_political_beta_today`, `quiver_political_beta_bulk`, and `quiver_offex_shortvol_ratio`.
+- Aggregates feed:
+  - LLM rationale and policy prompts via `_fetch_quiver_summary` in `services/forecast/forecast/llm_hooks.py` (e.g., “congress net +$X over 30/90d”, app ratings, ETF ownership, political beta, and off‑exchange short‑volume spikes).
+  - Optional risk heuristics / circuit‑breaker inputs when congressional trading, insider flows, or government awards cluster around individual names or sectors.
 
 3. N‑BEATS: Global Forecasting Model
 ------------------------------------
@@ -147,6 +163,22 @@ Weekly retrains (the “Wednesday night” job) now run through dedicated CLI en
   - `python3 tools/kronos_tft/train_tft.py --max-epochs 3 --patience 2 --scheduler-patience 1` (defaults to top 200 symbols × latest 400 observations; override `--max-symbols/--max-tail` for full runs).
 - **Artifacts:** each run produces `/mnt/data/models/kronos-*/<timestamp>/state.pt`, `config.json`, `METRICS.json`, `scaler.pkl`, plus a refreshed `latest` symlink that the services consume.
 
+6.2 LLM Overlay and Order‑Gate Policy
+-------------------------------------
+
+Kronos uses a separate large‑language‑model layer (“Lexi”) to translate raw signals and context into human‑readable narratives and structured policy recommendations that can gate trades.
+
+- **Runtime integration**
+  - The forecast service (`services/forecast/forecast/run.py`) calls into `generate_rationale` and `policy_filter` in `llm_hooks.py` after Kronos produces a forecast bundle and factor snapshot.
+  - `generate_rationale` builds a concise explanation (“why the model likes/dislikes this name”) using factor scores, recent headlines, and sentiment; the result is stored under `features->'llm'->'rationale'` in the `forecasts` table.
+  - `policy_filter` evaluates a JSON blob containing earnings timing, liquidity (1‑day notional), borrowability, factor dispersion, forecast coverage, macro regime, and optional Quiver aggregates (political flows, off‑exchange short volume, app ratings, ETF weights).
+- **Prompts, schemas, and A/B routing**
+  - Prompt templates live in `configs/llm_prompts.yaml` and are versioned; `LLM_AB_BUCKETS` and deterministic hashing in `_select_version` allow side‑by‑side testing of different prompt versions without changing application code.
+  - Responses are validated against `POLICY_SCHEMA` (`libs.llm.schemas`) to ensure the downstream allocator sees a simple `{allow: bool, reasons: [...], flags: [...]}` contract instead of free‑form text.
+- **Policy effect**
+  - The allocator reads `features.llm.policy` via `_llm_allow_from_features` (`services/policy/policy/run.py`); when `PT_BLOCK_IF_LLM_DENY=true`, any idea with `allow=false` is removed from the candidate universe even if its numerical score is strong.
+  - A global kill‑switch (`ORDER_GATE_DISABLED=true`) forces `allow=true` while still logging prompts/responses, so changes to the overlay can be rehearsed in “shadow mode” before they gate live orders.
+
 7. Policy: Portfolio Allocator & Execution Guardrails
 ----------------------------------------------------
 
@@ -170,7 +202,9 @@ Execution
 Service | Role | GPU | Key Volumes
 ---|---|---|---
 `kronos-nbeats` | Forecast server | 1 | `/models`, `/state`
+`kronos-tft` | Covariate‑aware forecaster | 1 (optional) | `/models`
 `kronos-graph` | Cross‑asset forecaster | 1 (optional) | `/models`
+`kronos-scenarios` | Diffusion scenario sampler | 1 (optional) | `/models`
 `kronos-calib` | Nightly calibration | CPU | `/mnt/data/kronos_state`
 `services/api` | Orchestration / routes | CPU | —
 

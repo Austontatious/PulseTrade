@@ -91,7 +91,15 @@ def upsert(conn, table: str, rows: List[Dict[str, object]]) -> None:
     if not rows:
         return
     cols = ["symbol", "period", "date", "payload"]
-    values = [[row[col] for col in cols] for row in rows]
+    # de-duplicate within batch to avoid ON CONFLICT multiple hits
+    seen = set()
+    dedup_values: List[List[object]] = []
+    for row in rows:
+        key = (row["symbol"], row["period"], row["date"])
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup_values.append([row[c] for c in cols])
     query = f"""
         INSERT INTO {table} ({', '.join(cols)})
         VALUES %s
@@ -100,7 +108,7 @@ def upsert(conn, table: str, rows: List[Dict[str, object]]) -> None:
             ts = now();
     """
     with conn.cursor() as cur:
-        extras.execute_values(cur, query, values, page_size=200)
+        extras.execute_values(cur, query, dedup_values, page_size=200)
     conn.commit()
 
 
@@ -125,6 +133,7 @@ def main() -> None:
         sys.exit("Universe file is empty.")
 
     conn = psycopg2.connect(database_url())
+    conn.autocommit = False
     session = requests.Session()
 
     for idx, symbol in enumerate(symbols, start=1):

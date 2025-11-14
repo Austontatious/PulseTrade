@@ -12,13 +12,20 @@ async def latest_signals(tickers: List[str] = Query(default=[]), horizon: str = 
     conn = await asyncpg.connect(dsn=DB_DSN)
     try:
         if not tickers:
-            q = """SELECT DISTINCT ON (ticker) ts, ticker, horizon, model, mean, lower, upper FROM forecasts
+            q = """SELECT DISTINCT ON (ticker) ts, ticker, horizon, model, mean, lower, upper, features FROM forecasts
                   WHERE horizon=$1 ORDER BY ticker, ts DESC LIMIT 100"""
             rows = await conn.fetch(q, horizon)
         else:
-            q = """SELECT DISTINCT ON (ticker) ts, ticker, horizon, model, mean, lower, upper FROM forecasts
+            q = """SELECT DISTINCT ON (ticker) ts, ticker, horizon, model, mean, lower, upper, features FROM forecasts
                   WHERE horizon=$1 AND ticker = ANY($2) ORDER BY ticker, ts DESC"""
             rows = await conn.fetch(q, horizon, tickers)
-        return [dict(r) for r in rows]
+        payload = []
+        for row in rows:
+            item = dict(row)
+            features = item.get("features") or {}
+            if isinstance(features, dict) and "llm" in features:
+                item["llm"] = features["llm"]
+            payload.append(item)
+        return payload
     finally:
         await conn.close()
