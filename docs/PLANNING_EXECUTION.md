@@ -18,6 +18,7 @@ This document explains how the live planning and execution pipeline works in Pul
 
 ## Core signals
 - Forecast deviation: `dev = mean/price − 1` (short‐horizon alpha proxy).
+- Source: since the November 2025 Kronos refresh, the `forecast` service writes 1‑minute horizons straight from the Kronos N‑BEATS container (log‑return converted back into a price target); the legacy moving‑average baseline only fires if Kronos is down, so every planner decision now reflects Kronos’ calibrated signal.
 - ATR proxy: std‐dev of 1‑second returns × price over last N minutes (volatility).
 - ATR z‐score: `z = |dev| × price / ATR` (signal normalized by regime vol).
 - Spread/age: from `quotes` for entry quality and to skip locked/stale markets.
