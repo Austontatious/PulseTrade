@@ -69,6 +69,7 @@ Implementation highlights:
   - `ALPACA_SYMBOLS=AAPL,MSFT,SPY` to choose equities for ingestion.
   - `ENABLE_ALPACA_EXECUTOR=1` to allow policy to submit paper orders.
   - `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET_KEY` from your Alpaca account.
+  - `ALPACA_ACCOUNT_ID` (12-character code from the Alpaca console, e.g., `PA3JGK6CZHA5`). The policy process validates the connected account matches this ID before sending orders so you don’t accidentally route to an old paper account.
   - Either set `ALPACA_ORDER_NOTIONAL=10` (preferred, uses dollar notional) or ensure your account supports fractional `qty`.
   - Optionally set `FORECAST_TICKERS` (defaults to `SYMBOLS`) so the forecaster targets your equities as they stream in.
 
