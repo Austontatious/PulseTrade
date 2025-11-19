@@ -1,0 +1,14 @@
+{
+  "count": 3340,
+  "exchanges": [
+    "NASDAQ",
+    "NYSE"
+  ],
+  "filters": {
+    "status": "active",
+    "asset_class": "us_equity",
+    "tradable": true,
+    "fractionable": true,
+    "shortable": true
+  }
+}

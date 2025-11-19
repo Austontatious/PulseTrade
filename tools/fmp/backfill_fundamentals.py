@@ -13,7 +13,14 @@ import requests
 FMP_API_KEY = os.getenv("FMP_API_KEY")
 BASE_URL = "https://financialmodelingprep.com/api/v3"
 RATE = float(os.getenv("RATE_MAX_HTTP_PER_SEC", "5"))
-SLEEP = 1.0 / max(RATE, 1.0)
+SYMBOL_SLEEP = os.getenv("FMP_SYMBOL_SLEEP_SECS")
+if SYMBOL_SLEEP is not None:
+    try:
+        SLEEP = max(float(SYMBOL_SLEEP), 0.0)
+    except ValueError:
+        SLEEP = 1.0 / max(RATE, 1.0)
+else:
+    SLEEP = 1.0 / max(RATE, 1.0)
 
 ENDPOINTS: Dict[str, str] = {
     "fmp_income_statement": "income-statement/{sym}",

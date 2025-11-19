@@ -1,0 +1,18 @@
+{
+  "date": "2025-11-17",
+  "total_candidates": 0,
+  "active_count": 0,
+  "candidates": [],
+  "active": [],
+  "config": {
+    "weekly_universe_size": 100,
+    "daily_candidate_count": 10,
+    "daily_max_trades": 20,
+    "max_actions_per_stock": 2,
+    "eps_mu": 0.0005,
+    "eps_p": 0.05,
+    "p_loss_max": 0.45,
+    "mu_min": 0.0001,
+    "lambda_risk": 1.0
+  }
+}

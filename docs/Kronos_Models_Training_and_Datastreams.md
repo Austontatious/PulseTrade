@@ -18,7 +18,7 @@ At a high level:
 - An **online calibration loop** keeps interval coverage stable as regimes change, without forcing full retrains each day.
 - A **strategist layer** ranks ideas with factor‑aware, regime‑sensitive scoring.
 - A **policy / allocator layer** converts signals to long/short target weights and routes orders via Alpaca, under strict exposure caps and circuit breakers.
-- A **large‑language‑model overlay** (“Lexi”) provides rationales and structured allow/deny decisions, so human reviewers and automated policies can interrogate and gate each idea.
+- A **large‑language‑model overlay** (“Finance”) provides rationales and structured allow/deny decisions, so human reviewers and automated policies can interrogate and gate each idea.
 
 The result is a modular stack: data streams, models, calibration, and portfolio logic are all independently deployable, observable services, wired together over Postgres and lightweight HTTP APIs.
 
@@ -105,14 +105,19 @@ Kronos sits between ingestion and execution:
   - Neural basis expansion model (N‑BEATS) trained in a global fashion across symbols.
   - Input window size defaults to 90 trading days; forecast horizon typically 5 days, with configuration support for horizons such as {1, 5, 20}.
 - **Training configuration (implemented in `tools/kronos_data/train_nbeats.py`):**
-  - Dataset: `/mnt/data/kronos_data/processed/nbeats_global_daily.parquet`.
+  - Default dataset: `/mnt/data/kronos_data/processed/nbeats_global_daily.parquet`.
   - Loss: `MQLoss` over quantiles (0.05, 0.5, 0.95), with sCRPS logged as an additional proper scoring rule.
-  - Split: per‑symbol chronological split with at least ~20 % of observations and ≥365 days held out for validation.
+  - Split: per-symbol chronological split with at least ~20 % of observations and ≥365 days held out for validation.
   - Optimisation: AdamW with ReduceLROnPlateau, gradient clipping at 1.0, light dropout and L2 regularisation.
 - **Artifacts and serving:**
   - Trained weights, hyperparameters, and metrics are persisted under `/mnt/data/models/kronos-nbeats/<run-id>/` (`state.pt`, `config.json`, `METRICS.json`, `VERSION`, `scaler.pkl`).
   - The service (`services/kronos-nbeats/app.py`) loads the artifact on startup when `MODEL_DIR` is set; otherwise it fits a small “toy” model per request for demo use.
   - At inference, predictions are adjusted by the online calibration state for each symbol.
+- **Alpaca-universe enrichment (2025 Q4):**
+  - `tools/kronos_data/build_alpaca_training_set.py` merges the Alpaca equity universe (≈3.4k symbols) with ≥420 days of `daily_returns`, FMP social sentiment (`fmp_social_sentiment`), and FMP v4 price targets (`fmp_price_targets_v4`), emitting `/mnt/data/kronos_data/processed/nbeats_alpaca_daily.parquet`. Sentiment/target covariates are forward/back-filled per symbol; remaining gaps are set to `0.0` (interpreted as “neutral/unavailable”).
+  - The training script exposes `--feature-cols`, `--residuals-out`, `--min-holdout-days`, `--min-holdout-frac`, and `--devices`. Covariates are logged as “ignored” because the current NeuralForecast build lacks `X_df` support, but the data is preserved; residuals are persisted for the Top-100 “best fit” ranking.
+  - `tools/kronos_data/rank_best_fit.py` consumes the residual parquet, computes MAE/directional accuracy for 30/60/90-day windows, and writes a Top-K JSON plus optional `services/ingest/universe_symbols.txt` update.
+  - `tools/pipeline/train_nbeats_alpaca.py` orchestrates the entire flow (build dataset → train → evaluate → refresh Top 100) and should be scheduled weekly to keep training and allocator universes aligned. Use `--devices 1` on single-GPU hosts and relax holdouts via CLI flags if the strict per-symbol window is too short.
 
 4.2 Temporal Fusion Transformer (`kronos-tft`)
 - **Objective:** extend return forecasts with **covariate‑aware context**, including fundamentals, valuation metrics, and basic news/sentiment counts.
@@ -194,7 +199,7 @@ The online calibrator is designed to keep forecast intervals credible as regimes
 7.2 LLM Rationale and Policy Overlay
 - **Rationale:**
   - `generate_rationale` in `llm_hooks.py` composes a prompt from signal strength, factor exposure (`_extract_factors`), and recent headlines.
-  - The Lexi vLLM server returns a short explanation, cached and stored under `features.llm.rationale`.
+  - The Finance vLLM server returns a short explanation, cached and stored under `features.llm.rationale`.
 - **Policy filter:**
   - `policy_filter` encodes liquidity, earnings timing, borrowability, factor dispersion, coverage statistics, macro regime, and Quiver aggregates into `inputs_json`.
   - The response is validated against `POLICY_SCHEMA`, yielding a structured `{allow, reasons, flags}` object recorded as `features.llm.policy`.
@@ -228,4 +233,3 @@ The online calibrator is designed to keep forecast intervals credible as regimes
   - The stack assumes liquid, large‑cap universes by default; running it unchanged on illiquid or thinly traded names may degrade calibration and execution quality.
 
 Kronos is intentionally modular so that each component—data ingestion, model training, calibration, strategist, policy, and LLM overlay—can evolve independently while preserving a transparent, auditable path from raw data to portfolio action.
-

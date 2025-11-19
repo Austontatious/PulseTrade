@@ -1,23 +1,24 @@
 import asyncio
 import datetime as dt
 import json
+import logging
 import os
 from collections import defaultdict
 from statistics import mean, pstdev
 
 import asyncpg
+from services.ingest.config import DB_DSN
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-DB_DSN = (
-    f"postgresql://{os.getenv('POSTGRES_USER', 'pulse')}:{os.getenv('POSTGRES_PASSWORD', 'pulsepass')}@"
-    f"{os.getenv('POSTGRES_HOST', 'db')}:{os.getenv('POSTGRES_PORT', '5432')}/{os.getenv('POSTGRES_DB', 'pulse')}"
-)
-
-WINDOWS = (5, 15, 60)
+WINDOWS = (5, 15, 60, 60 * 24 * 7)
 BATCH_SIZE = int(os.getenv("SENTIMENT_BATCH_SIZE", "200"))
 SLEEP_SECS = int(os.getenv("SENTIMENT_SLEEP_SECS", "60"))
+POS_THRESHOLD = float(os.getenv("SENTIMENT_POS_THRESHOLD", "0.1"))
+NEG_THRESHOLD = float(os.getenv("SENTIMENT_NEG_THRESHOLD", "-0.1"))
 
 _analyzer = SentimentIntensityAnalyzer()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 async def _score_batch(conn: asyncpg.Connection) -> int:
     rows = await conn.fetch(
@@ -31,10 +32,12 @@ async def _score_batch(conn: asyncpg.Connection) -> int:
         BATCH_SIZE,
     )
     if not rows:
+        logger.info("No pending social messages found for sentiment scoring.")
         return 0
     for row in rows:
         score = _analyzer.polarity_scores(row["text"])
         compound = float(score["compound"])
+        logger.info("Processing sentiment for %s from %s", row["ticker"], row["source"])
         await conn.execute(
             """
             UPDATE social_messages
@@ -49,23 +52,38 @@ async def _score_batch(conn: asyncpg.Connection) -> int:
             row["ticker"],
             row["text"],
         )
+    logger.info("Scored %s social messages.", len(rows))
     return len(rows)
 
+def _classify(sentiment: float) -> str:
+    if sentiment is None:
+        return "neu"
+    if sentiment > POS_THRESHOLD:
+        return "pos"
+    if sentiment < NEG_THRESHOLD:
+        return "neg"
+    return "neu"
+
+
 async def _aggregate_sentiment(conn: asyncpg.Connection) -> None:
+    max_window = max(WINDOWS)
     rows = await conn.fetch(
         """
         SELECT ts, ticker, handle, sentiment
         FROM social_messages
-        WHERE ts > NOW() - INTERVAL '60 minutes' AND sentiment IS NOT NULL
-        """
+        WHERE ts > NOW() - make_interval(mins => $1::int) AND sentiment IS NOT NULL
+        """,
+        max_window,
     )
     if not rows:
+        logger.info("No recent sentiment data available for aggregation.")
         return
     now = dt.datetime.now(dt.timezone.utc)
     cutoffs = {window: now - dt.timedelta(minutes=window) for window in WINDOWS}
 
     values = {window: defaultdict(list) for window in WINDOWS}
     handles = {window: defaultdict(lambda: defaultdict(list)) for window in WINDOWS}
+    sentiment_counts = {window: defaultdict(lambda: {"pos": 0, "neg": 0, "neu": 0}) for window in WINDOWS}
 
     for row in rows:
         ts = row["ts"]
@@ -77,6 +95,9 @@ async def _aggregate_sentiment(conn: asyncpg.Connection) -> None:
                 values[window][ticker].append(sentiment)
                 if handle:
                     handles[window][ticker][handle].append(sentiment)
+                bucket = sentiment_counts[window][ticker]
+                label = _classify(sentiment)
+                bucket[label] += 1
 
     insert_rows = []
     for window in WINDOWS:
@@ -99,6 +120,7 @@ async def _aggregate_sentiment(conn: asyncpg.Connection) -> None:
                 )
             handle_stats.sort(key=lambda h: (-(h["count"]), -abs(h["avg"])))
             top_handles = json.dumps(handle_stats[:3])
+            counts = sentiment_counts[window][ticker]
             insert_rows.append(
                 (
                     now,
@@ -108,22 +130,40 @@ async def _aggregate_sentiment(conn: asyncpg.Connection) -> None:
                     senti_mean,
                     senti_std,
                     top_handles,
+                    counts["pos"],
+                    counts["neg"],
+                    counts["neu"],
                 )
             )
     if insert_rows:
         await conn.executemany(
             """
-            INSERT INTO social_features(ts, ticker, window_minutes, msg_rate, senti_mean, senti_std, top_handles)
-            VALUES($1,$2,$3,$4,$5,$6,$7)
+            INSERT INTO social_features(
+                ts,
+                ticker,
+                window_minutes,
+                msg_rate,
+                senti_mean,
+                senti_std,
+                top_handles,
+                pos_count,
+                neg_count,
+                neu_count
+            )
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             ON CONFLICT (ts, ticker, window_minutes)
             DO UPDATE SET
               msg_rate = EXCLUDED.msg_rate,
               senti_mean = EXCLUDED.senti_mean,
               senti_std = EXCLUDED.senti_std,
-              top_handles = EXCLUDED.top_handles
+              top_handles = EXCLUDED.top_handles,
+              pos_count = EXCLUDED.pos_count,
+              neg_count = EXCLUDED.neg_count,
+              neu_count = EXCLUDED.neu_count
             """,
             insert_rows,
         )
+        logger.info("Upserted %s aggregated sentiment rows into social_features.", len(insert_rows))
 
 async def run_sentiment_loop() -> None:
     while True:
@@ -141,3 +181,12 @@ async def run_sentiment_loop() -> None:
         except Exception as exc:  # pragma: no cover - log and continue
             print("sentiment loop error:", exc)
         await asyncio.sleep(SLEEP_SECS)
+
+
+def main() -> None:
+    """Entry point so `python -m worker.sentiment` can run the loop."""
+    asyncio.run(run_sentiment_loop())
+
+
+if __name__ == "__main__":
+    main()

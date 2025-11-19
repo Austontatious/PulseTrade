@@ -145,3 +145,13 @@ tft.train:
 
 tft.up:
 	docker compose up -d --build kronos-tft
+
+.PHONY: signal.universe daily.plans liquidity.backfill
+signal.universe:
+	docker compose run --rm tools bash -lc 'python tools/universe/build_signal_universe.py --as-of "$${DATE:-$$(TZ=America/Chicago date +%F)}"'
+
+daily.plans:
+	docker compose run --rm tools bash -lc 'python tools/planner/build_daily_plans.py --date "$${DATE:-$$(TZ=America/Chicago date +%F)}"'
+
+liquidity.backfill:
+	docker compose run --rm tools bash -lc 'python scripts/backfill_liquidity.py --limit "$${LIMIT:-$${LIQUIDITY_BACKFILL_LIMIT:-300}}" --lookback-days "$${LOOKBACK_DAYS:-$${LIQUIDITY_BACKFILL_LOOKBACK_DAYS:-90}}"'

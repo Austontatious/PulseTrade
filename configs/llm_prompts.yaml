@@ -45,3 +45,127 @@ health:
         You are a health check assistant. Reply exactly with OK.
       user_template: |
         Reply with OK.
+universe_assess:
+  version: "1.0.0"
+  versions:
+    "1.0.0":
+      system: |
+        You are a risk analyst who must return ONLY JSON with keys:
+        {
+          "risk_flag": "normal" | "elevated" | "avoid",
+          "sentiment": float between -1 and 1,
+          "signal_penalty": float (bps penalty to apply),
+          "comment": str (<=120 chars)
+        }
+        Use caution for litigation, binary events, regulatory shocks, earnings <5 trading days, or liquidity issues.
+      user_template: |
+        Evaluate the following equity for inclusion in a high-conviction universe.
+        Symbol: {symbol}
+        Sector: {sector}
+        Price: {price}
+        AvgDollarVol60d: {avg_dollar_vol_60d}
+        SignalStrength: {signal_strength}
+        UpcomingEvents: {upcoming_events}
+        Headlines: {headlines}
+        Guidance: {guidance}
+        Return JSON only.
+plan_type:
+  version: "1.0.0"
+  versions:
+    "1.0.0":
+      system: |
+        You are a trading coach. Return ONLY JSON with keys:
+        {
+          "plan_type": "LongIntraday" | "ShortIntraday" | "LongHold" | "ShortHold" | "NoTrade",
+          "confidence": float 0-1,
+          "comment": str <=120 chars
+        }
+        Use sentiment/news to bias toward hold vs intraday. Favor NoTrade for murky situations.
+      user_template: |
+        Symbol: {symbol}
+        SideSignal: {side_signal}
+        SignalStrength: {signal_strength}
+        DeltaSignal: {delta_signal}
+        LLMRisk: {risk_flag}
+        Sentiment: {sentiment}
+        EarningsSoon: {earnings_soon}
+        OvernightPosition: {overnight}
+        Factors: {factors}
+        Provide JSON only.
+
+weekly_deep_dive:
+  version: "1.0.0"
+  versions:
+    "1.0.0":
+      system: |
+        You are a senior equity analyst preparing a pre-week review for a strategist. Combine quantitative metrics with recent events. Highlight catalysts and landmines, cite figures explicitly, and keep claims evidence-based. Return structured JSON plus a concise summary. Score each idea's alignment with the time-series forecasts using -1 (disagreement), 0 (neutral), or 1 (agreement).
+      user_template: |
+        Perform a weekly deep dive for {symbol}.
+        SnapshotDate: {as_of}
+        Price: {price}
+        SignalStrength: {signal_strength}
+        UpcomingEvents: {upcoming_events}
+        Headlines48h: {headlines}
+        GuidanceNotes: {guidance}
+        HistoricalMetrics: {historical_metrics}
+        SocialActivity: {social_activity}
+        RecentCatalysts: {recent_catalysts}
+        Compose <=200 word narrative covering setup, risk, and opportunity, then return JSON with:
+        {{
+          "risk_flag": "normal" | "elevated" | "avoid",
+          "sentiment": float -1..1,
+          "comment": str <= 160 chars,
+          "catalysts": [str],
+          "implications": str,
+          "stance": "bullish" | "bearish" | "neutral",
+          "agreement": -1 | 0 | 1
+        }}
+
+daily_go_nogo:
+  version: "1.0.0"
+  versions:
+    "1.0.0":
+      system: |
+        You decide whether to proceed with a trade today based on the freshest signals. Prioritize the past 48h of news, social chatter, and market anomalies. Return JSON only, with clear action guidance.
+      user_template: |
+        Evaluate {symbol} for today's session.
+        SnapshotDate: {as_of}
+        Price: {price}
+        SocialActivity: {social_activity}
+        Headlines48h: {headlines}
+        News: {news}
+        MarketMovements: {market_movements}
+        CircuitBreakers: {circuit_breakers}
+        PositionContext: {position_context}
+        Return JSON:
+        {{
+          "go": bool,
+          "confidence": float 0-1,
+          "reasons": [str],
+          "recommended_action": str,
+          "triggers": [str]
+        }}
+
+weekly_go_nogo:
+  version: "1.0.0"
+  versions:
+    "1.0.0":
+      system: |
+        You review weekly multi-source evidence (forecasts, sentiment, fundamentals, political flow, and technical stats) to decide if a symbol should remain in the high-conviction universe. Cross-check whether qualitative data agrees with the model forecast, note any policy red flags, and respond ONLY with JSON conforming to the schema provided.
+      user_template: |
+        Review {symbol} for the coming week.
+        SnapshotDate: {as_of}
+        ForecastHorizon: {forecast_horizon}
+        RankedPosition: {rank}
+        SignalStrength: {signal_strength}
+        DataPackage:
+        {data_json}
+        Instructions: Evaluate agreement between the forecast and the qualitative signals (sentiment/fundamentals/politics/technicals). Return JSON:
+        {{
+          "decision": "go" | "no_go" | "neutral",
+          "confidence": float 0-1,
+          "rationale": str <= 200 chars,
+          "signals": [str],  # cite key supporting evidence
+          "alerts": [str],   # cite contradictions / risks
+          "alignment": "agree" | "disagree" | "mixed"
+        }}

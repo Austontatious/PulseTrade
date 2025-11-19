@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from typing import List, Tuple
 
 import asyncpg
@@ -42,6 +43,7 @@ async def refresh_shortable_flags(status: str = "active") -> int:
         return 0
 
     rows: List[Tuple[str, bool, bool]] = []
+    symbol_rows: List[Tuple[str, str, str, str]] = []
     for item in data:
         symbol = (item.get("symbol") or "").upper()
         if not symbol:
@@ -49,6 +51,26 @@ async def refresh_shortable_flags(status: str = "active") -> int:
         shortable = bool(item.get("shortable"))
         easy_to_borrow = bool(item.get("easy_to_borrow"))
         rows.append((symbol, shortable, easy_to_borrow))
+
+        venue = item.get("exchange") or item.get("primary_exchange") or "ALPACA"
+        meta = {
+            "alpaca": {
+                "asset_id": item.get("id"),
+                "status": item.get("status"),
+                "class": item.get("asset_class"),
+                "exchange": venue,
+                "fractionable": item.get("fractionable"),
+                "marginable": item.get("marginable"),
+            }
+        }
+        symbol_rows.append(
+            (
+                symbol,
+                "equity",
+                venue or "ALPACA",
+                json.dumps(meta),
+            )
+        )
 
     if not rows:
         return 0
@@ -75,7 +97,20 @@ async def refresh_shortable_flags(status: str = "active") -> int:
 
     conn = await asyncpg.connect(dsn=DB_DSN)
     try:
-        await conn.executemany(sql, rows)
+        async with conn.transaction():
+            await conn.executemany(sql, rows)
+            if symbol_rows:
+                await conn.executemany(
+                    """
+                    INSERT INTO symbols(ticker, class, venue, meta)
+                    VALUES($1,$2,$3, COALESCE($4::jsonb, '{}'::jsonb))
+                    ON CONFLICT (ticker, class)
+                    DO UPDATE SET
+                        venue = EXCLUDED.venue,
+                        meta = COALESCE(symbols.meta, '{}'::jsonb) || EXCLUDED.meta
+                    """,
+                    symbol_rows,
+                )
     finally:
         await conn.close()
 

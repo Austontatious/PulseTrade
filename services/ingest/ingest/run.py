@@ -12,6 +12,8 @@ from .collectors.fmp_estimates import fetch_estimates as fmp_estimates
 from .collectors.fmp_rating import fetch_rating as fmp_rating
 from .collectors.fmp_profile import fetch_profile as fmp_profile
 from .collectors.fmp_screens import fetch_screens as fmp_screens
+from .collectors.fmp_sentiment import fetch_sentiment as fmp_sentiment
+from .collectors.fmp_price_target_v4 import fetch_price_targets as fmp_price_targets_v4
 from .collectors.stocktwits_trending import fetch_trending_symbols as st_trending
 from .collectors.fmp_calendar import fetch_earnings_calendar
 from .collectors.fmp_news import fetch_news_for as fmp_news
@@ -34,6 +36,8 @@ async def poll_http_sources() -> None:
             coros.extend(fmp_estimates(t) for t in TICKERS if not t.endswith("USD"))
             coros.extend(fmp_rating(t) for t in TICKERS if not t.endswith("USD"))
             coros.extend(fmp_profile(t) for t in TICKERS if not t.endswith("USD"))
+        if os.getenv("ENABLE_FMP_PRICE_TARGET_V4", "0") == "1":
+            coros.extend(fmp_price_targets_v4(t) for t in TICKERS if not t.endswith("USD"))
         if os.getenv("ENABLE_FMP_SCREENS", "1") == "1":
             coros.append(fmp_screens())
         if os.getenv("ENABLE_STOCKTWITS_TRENDING", "1") == "1":
@@ -47,6 +51,9 @@ async def poll_http_sources() -> None:
             syms = list(dict.fromkeys([*alp, *eq_syms]))[:100]
             if syms:
                 coros.append(fmp_news(syms))
+        if os.getenv("ENABLE_FMP_SENTIMENT", "0") == "1":
+            symbols = [t for t in TICKERS if not t.endswith("USD")]
+            coros.extend(fmp_sentiment(sym) for sym in symbols)
         if os.getenv("ENABLE_STOCKTWITS", "0") == "1":
             symbols = [t for t in TICKERS if not t.endswith("USD")]
             coros.extend(stocktwits_fetch(sym) for sym in symbols)

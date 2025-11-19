@@ -3,3 +3,4 @@
 from .client import LLMClient  # noqa: F401
 from .run_and_log import LLMRunner  # noqa: F401
 from .registry import PromptRegistry  # noqa: F401
+from .settings import is_llm_enabled  # noqa: F401

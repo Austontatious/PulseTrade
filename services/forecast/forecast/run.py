@@ -6,6 +6,7 @@ import os
 import random
 from datetime import datetime, timezone
 from functools import partial
+from pathlib import Path
 from typing import Any, Dict, List
 
 import asyncpg
@@ -13,12 +14,26 @@ import pandas as pd
 
 from libs.kronos_client.client import ForecastClient
 from .llm_hooks import generate_rationale, policy_filter, _fetch_quiver_summary
+from libs.llm.settings import is_llm_enabled
 
 from .model_swap import Model
 
+def _parse_horizons(raw: str) -> List[int]:
+    values: List[int] = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            values.append(int(chunk))
+        except ValueError:
+            continue
+    return values or [5]
+
+
 NBEATS_URL = os.getenv("FORECAST_URL_NBEATS", "http://kronos-nbeats:8080")
 _KRONOS_TIMEOUT = float(os.getenv("FORECAST_CLIENT_TIMEOUT", "2.0"))
-KRONOS_HORIZON = [1, 5, 20]
+KRONOS_HORIZON = _parse_horizons(os.getenv("KRONOS_HORIZON_STEPS", "5"))
 
 kronos_client = ForecastClient(NBEATS_URL, timeout=_KRONOS_TIMEOUT)
 
@@ -29,10 +44,15 @@ DB_DSN = f"postgresql://{os.getenv('POSTGRES_USER','pulse')}:{os.getenv('POSTGRE
 # 1) FORECAST_TICKERS (explicit override)
 # 2) SYMBOLS (shared env across services)
 # 3) Fallback crypto only
+ROOT_DIR = Path(__file__).resolve().parents[2]
+UNIVERSE_FILE = Path(os.getenv("FORECAST_UNIVERSE_FILE", "services/ingest/universe_symbols.txt"))
+if not UNIVERSE_FILE.is_absolute():
+    UNIVERSE_FILE = ROOT_DIR / UNIVERSE_FILE
+
 _tickers_env = os.getenv("FORECAST_TICKERS") or os.getenv("SYMBOLS", "")
 ENV_TICKERS = [t.strip() for t in _tickers_env.split(",") if t and t.strip()] or ["BTCUSD", "ETHUSD"]
 FORECAST_MAX_TICKERS = int(os.getenv("FORECAST_MAX_TICKERS", "50"))
-HORIZON = "1m"
+HORIZON = os.getenv("FORECAST_HORIZON", "5d")
 MODEL = Model()
 MODEL_NAME = MODEL.__class__.__name__
 logger = logging.getLogger(__name__)
@@ -155,6 +175,8 @@ async def _attach_llm_context(
     signal_label: str,
     covariates: Dict[str, Any],
 ) -> Dict[str, Any]:
+    if not is_llm_enabled():
+        return {"rationale": None, "policy": None}
     as_of = datetime.now(timezone.utc).isoformat()
     factors = _extract_factors(covariates)
     factor_dispersion = max((abs(v) for v in factors.values()), default=0.0)
@@ -237,12 +259,49 @@ async def _attach_llm_context(
     llm_meta["quiver"] = quiver_summary
     return llm_meta
 
+async def _load_price_series(conn, ticker: str) -> pd.Series | None:
+    trade_rows = await conn.fetch(
+        """SELECT ts, price FROM trades WHERE ticker=$1 AND ts > NOW() - INTERVAL '10 minutes' ORDER BY ts ASC""",
+        ticker,
+    )
+    if len(trade_rows) >= 5:
+        return pd.Series([r["price"] for r in trade_rows], index=[r["ts"] for r in trade_rows])
+
+    daily_rows = await conn.fetch(
+        """SELECT ds, y FROM daily_returns WHERE symbol=$1 ORDER BY ds DESC LIMIT 256""",
+        ticker,
+    )
+    if not daily_rows:
+        return None
+    daily_rows = list(reversed(daily_rows))
+    prices: List[float] = []
+    current = 1.0
+    for row in daily_rows:
+        try:
+            current *= math.exp(float(row["y"]))
+        except Exception:
+            continue
+        prices.append(current)
+    if not prices:
+        return None
+    series = pd.Series(prices, index=[row["ds"] for row in daily_rows[: len(prices)]])
+    last_price = await conn.fetchval(
+        """SELECT NULLIF(meta->>'last_price','')::numeric FROM symbols WHERE ticker=$1""",
+        ticker,
+    )
+    if last_price:
+        try:
+            scale = float(last_price) / float(series.iloc[-1])
+            series = series * scale
+        except Exception:
+            pass
+    return series
+
+
 async def forecast_once(conn, ticker: str):
-    q = """SELECT ts, price FROM trades WHERE ticker=$1 AND ts > NOW() - INTERVAL '10 minutes' ORDER BY ts ASC"""
-    rows = await conn.fetch(q, ticker)
-    if len(rows) < 5:
+    s = await _load_price_series(conn, ticker)
+    if s is None or s.empty:
         return
-    s = pd.Series([r["price"] for r in rows], index=[r["ts"] for r in rows])
     covariates = await load_covariates(conn, ticker)
     kronos_bundle = await _fetch_kronos_bundle(ticker, s)
     factors = _extract_factors(covariates)
@@ -306,6 +365,25 @@ async def forecast_once(conn, ticker: str):
                           VALUES(NOW(), $1, $2, $3, $4, $5, $6, $7)""",
                        ticker, HORIZON, model_name, mean, lower, upper, json.dumps(feature_snapshot))
 
+def _load_file_universe() -> List[str]:
+    if not UNIVERSE_FILE.exists():
+        return []
+    symbols: List[str] = []
+    try:
+        with UNIVERSE_FILE.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                sym = line.strip().upper()
+                if sym and not sym.startswith("#"):
+                    symbols.append(sym)
+    except Exception:
+        return []
+    # Preserve order, drop duplicates
+    deduped: Dict[str, None] = {}
+    for sym in symbols:
+        deduped.setdefault(sym, None)
+    return list(deduped.keys())
+
+
 async def main():
     logging.basicConfig(level=logging.INFO)
     while True:
@@ -322,7 +400,20 @@ async def main():
                 dyn = [r[0] for r in rows]
             except Exception:
                 dyn = []
-            all_ticks = list({*ENV_TICKERS, *dyn})
+
+            universe_ticks = _load_file_universe()
+            if not universe_ticks:
+                source_list = ENV_TICKERS
+            else:
+                source_list = universe_ticks
+
+            merged = source_list + [sym for sym in ENV_TICKERS if sym not in source_list] + [sym for sym in dyn if sym not in source_list]
+            all_ticks = []
+            seen = set()
+            for sym in merged:
+                if sym not in seen:
+                    seen.add(sym)
+                    all_ticks.append(sym)
             if len(all_ticks) > FORECAST_MAX_TICKERS:
                 random.shuffle(all_ticks)
                 all_ticks = all_ticks[:FORECAST_MAX_TICKERS]

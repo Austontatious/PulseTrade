@@ -1,0 +1,17 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Nightly Alpaca/FMP dataset refresh – every day 21:30 CST
+30 21 * * * cd /workspace && ENABLE_LLM=0 python tools/kronos_data/build_alpaca_training_set.py --symbols db/alpaca_universe.symbols.txt --lookback-days 420 --out /mnt/data/kronos_data/processed/nbeats_alpaca_daily.parquet
+
+# Weekly N-BEATS training – Fridays 23:00 CST
+0 23 * * 5 cd /workspace && ENABLE_LLM=0 python tools/kronos_data/train_nbeats.py --data /mnt/data/kronos_data/processed/nbeats_alpaca_daily.parquet --out /mnt/data/models/kronos-nbeats --horizon 5 --input-size 126 --max-epochs 80 --devices 1
+
+# Weekly Top-100 universe rebuild – Fridays 23:10 CST (after training)
+10 23 * * 5 cd /workspace && ENABLE_LLM=0 bash -lc 'python tools/universe/build_signal_universe.py --as-of $(date +\%F)'
+
+# Nightly forecasts (T+1/T+2) – Sunday-Thursday 23:00 CST
+0 23 * * 0-4 cd /workspace && ENABLE_LLM=0 bash -lc 'python tools/pipeline/run_nightly_forecasts.py --as-of $(date +\%F) --predict-horizons 1,2'
+
+# Nightly strategy/planning – Sunday-Thursday 23:10 CST (after forecasts)
+10 23 * * 0-4 cd /workspace && ENABLE_LLM=0 bash -lc 'python tools/planner/build_daily_plans.py --date $(date -d "tomorrow" +\%F)'

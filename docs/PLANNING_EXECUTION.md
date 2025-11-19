@@ -42,7 +42,14 @@ This document explains how the live planning and execution pipeline works in Pul
    - Sentiment alignment reduces required threshold; fundamentals veto if flow contradicts the side.
 
 6) Top‑K and cool‑down
-   - Planner considers only the top `PLANNER_TOP_K` symbols per step and enforces a per‐symbol cool‐down (e.g., 30 min) to reduce churn.
+- Planner considers only the top `PLANNER_TOP_K` symbols per step and enforces a per-symbol cool-down (e.g., 30 min) to reduce churn.
+
+## Monte Carlo universe ranking (optional)
+- When `ENABLE_MONTE_CARLO=1`, weekly signal builds call `tools/universe/monte_carlo_sim.py` after LLM screening. Each ranked symbol gets `MONTE_CARLO_SIMS` log-normal paths over `MONTE_CARLO_DAYS` using the most recent `daily_returns` mean/std.
+- Results are stored in `universe_monte_carlo` (schema added via `20251120_add_monte_carlo_universe.sql`), embedded inside `signal_universe_100.meta["monte_carlo"]`, and exported to `reports/monte_carlo_*`. With the flag off (default), the weekly build skips this stage entirely and the planner/policy ignore Monte Carlo metadata.
+- Metrics: each run optionally pushes `pulse_monte_carlo_duration_seconds`, `pulse_monte_carlo_symbols_processed`, and `pulse_monte_carlo_top_best_score` via `PROM_PUSHGATEWAY`.
+- Planner: when Monte Carlo data exists, `build_daily_plans.py` can consume the extra mean/std; otherwise it falls back to the nightly forecast quantiles to estimate mu/σ for `evaluate_plan`.
+- Policy: `services/policy/policy/run.py` only enforces `PT_REQUIRE_MONTE_TOP` when Monte Carlo is enabled; the Prometheus gauge `policy_monte_top_overlap` updates accordingly.
 
 ## Allocator (long + short)
 - Inputs: latest `Idea` objects from forecasts, live prices, sectors, and existing weights.
@@ -117,6 +124,10 @@ Action: Insert an active `('global','ALL')` breaker with TTL (e.g., 60m). Policy
 - Exit mgr: `ENABLE_EXIT_MANAGER`.
 - Blackout: `ENABLE_EARNINGS_BLACKOUT`, `EARNINGS_BLACKOUT_MIN`.
 - Breakers: `ENABLE_CIRCUIT_BREAKERS`, `SYMBOL_BREAKER_TTL_MIN`, `GLOBAL_BREAKER_FRAC`, `GLOBAL_BREAKER_TTL_MIN`, `EWMA_LAMBDA`.
+
+## Automation (scheduler service)
+- `docker/scheduler.cron` holds the nightly/weekly cron entries (dataset refresh, Friday N-BEATS retrain + Top‑100 rebuild, nightly forecasts, nightly planner).
+- Start the cron daemon with `docker compose up -d scheduler`; edit the cron file and `docker compose restart scheduler` when timings change.
 
 ## Control flow (per cycle)
 1) Load active knobs/breakers.

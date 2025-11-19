@@ -3,6 +3,7 @@ import json
 import os
 import datetime as dt
 from statistics import mean
+from typing import Any, Dict, List
 
 DB_DSN = (
     f"postgresql://{os.getenv('POSTGRES_USER', 'pulse')}:{os.getenv('POSTGRES_PASSWORD', 'pulsepass')}@"
@@ -20,6 +21,31 @@ ENABLE_TURNAROUND = os.getenv("STRAT_ENABLE_TURNAROUND", "0") == "1"
 async def _universe(conn: asyncpg.Connection) -> list[str]:
     rows = await conn.fetch("SELECT ticker FROM symbols WHERE class='equity' ORDER BY ticker ASC LIMIT 1000")
     return [r[0] for r in rows]
+
+
+async def _weekly_llm_reviews(conn: asyncpg.Connection, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not symbols:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT symbol, output_json
+        FROM llm_symbol_reviews
+        WHERE scope='weekly_deep_dive'
+          AND as_of = (
+            SELECT MAX(as_of) FROM llm_symbol_reviews WHERE scope='weekly_deep_dive'
+          )
+          AND symbol = ANY($1)
+        """,
+        symbols,
+    )
+    mapping: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        sym = (row["symbol"] or "").upper()
+        if not sym:
+            continue
+        payload = row["output_json"] or {}
+        mapping[sym] = payload
+    return mapping
 
 async def _latest_factors(conn: asyncpg.Connection, symbol: str):
     row = await conn.fetchrow(
@@ -201,6 +227,7 @@ async def generate_recommendations() -> None:
     try:
         regime = await _current_regime(conn)
         tickers = await _universe(conn)
+        llm_reviews = await _weekly_llm_reviews(conn, tickers)
         recos = []
         for t in tickers:
             feat = await _features(conn, t)
@@ -217,7 +244,21 @@ async def generate_recommendations() -> None:
                     continue
             s = _score(feat, regime)
             side = "buy" if s >= 0 else "sell"
-            recos.append((t, side, s, feat))
+            review_obj = llm_reviews.get(t.upper())
+            if isinstance(review_obj, dict):
+                review = review_obj
+                if review.get("risk_flag") == "avoid":
+                    continue
+                sentiment = float(review.get("sentiment") or 0.0)
+                s += 0.05 * sentiment
+                stance = (review.get("stance") or "neutral").lower()
+                if stance == "bearish" and s > 0:
+                    s *= 0.8
+                elif stance == "bullish" and s < 0:
+                    s *= 0.8
+            else:
+                review = None
+            recos.append((t, side, s, feat, review))
         # Rank by absolute score and take top-k
         recos.sort(key=lambda r: -abs(r[2]))
         recos = recos[:MAX_RECO]
@@ -237,6 +278,7 @@ async def generate_recommendations() -> None:
                     f"blend(mom_q_senti); regime={regime}",
                     json.dumps({
                         "feat": feat,
+                        "llm": review,
                         "contrib": {
                             "mom_s": feat["mom_s"],
                             "mom_m": feat["mom_m"],
@@ -248,7 +290,7 @@ async def generate_recommendations() -> None:
                         },
                     }),
                 )
-                for (t, side, score, feat) in recos
+                for (t, side, score, feat, review) in recos
             ],
         )
         print(f"strategist recos: wrote {len(recos)} regime={regime}")

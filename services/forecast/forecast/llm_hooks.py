@@ -10,9 +10,11 @@ from typing import Any, Dict, Iterable, Optional
 
 from libs.llm.run_and_log import LLMRunner
 from libs.llm.schemas import POLICY_SCHEMA
+from libs.llm.settings import is_llm_enabled
 
 
-runner = LLMRunner()
+LLM_ENABLED = is_llm_enabled()
+runner = LLMRunner() if LLM_ENABLED else None
 SHADOW_MODE = os.getenv("LLM_SHADOW_MODE", "false").lower() == "true"
 ORDER_GATE_DISABLED = os.getenv("ORDER_GATE_DISABLED", "false").lower() == "true"
 QUIVER_PUBLIC_EXTRAS = os.getenv("QUIVER_ENABLE_PUBLIC_EXTRAS", "false").lower() == "true"
@@ -239,6 +241,21 @@ async def _call_runner(
     schema: Dict[str, Any] | None = None,
     max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
+    if not LLM_ENABLED or runner is None:
+        response = {
+            "text": None,
+            "json": None,
+            "cached": False,
+            "prompt_key": prompt_key,
+            "prompt_version": "disabled",
+            "prompt_hash": "llm_disabled",
+            "success": False,
+            "error": "llm_disabled",
+        }
+        if prompt_key == "policy":
+            response["json"] = {"allow": True, "reasons": ["llm_disabled"], "flags": []}
+        return response
+
     loop = asyncio.get_running_loop()
     func = partial(
         runner.cached_call,
@@ -320,13 +337,14 @@ async def policy_filter(
         "inputs_json": json.dumps(inputs),
     }
     version = _select_version("policy", ticker, as_of)
+    policy_version = version or (runner.registry.get("policy").version if runner else "disabled")
     if ORDER_GATE_DISABLED:
         result = {
             "text": json.dumps({"allow": True, "reasons": ["kill_switch"], "flags": []}),
             "json": {"allow": True, "reasons": ["kill_switch"], "flags": []},
             "cached": False,
             "prompt_key": "policy",
-            "prompt_version": version or runner.registry.get("policy").version,
+            "prompt_version": policy_version,
             "prompt_hash": "kill_switch",
             "success": True,
             "shadow": SHADOW_MODE,

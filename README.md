@@ -25,6 +25,36 @@ This monorepo ships a minimal, production-lean trading research stack:
 4) Open API: http://localhost:8001/docs
 5) Prometheus: http://localhost:9090
 
+### Bring the live loop up
+1. Apply the latest DB migrations (LLM + signal universe) **once**:
+   ```bash
+   docker compose exec -T db psql -U pulse -d pulse -f db/migrations/20251027_add_llm_tables.sql
+   docker compose exec -T db psql -U pulse -d pulse -f db/migrations/20251114_signal_universe.sql
+   ```
+2. Set Alpaca + forecast knobs in `.env`:
+   ```ini
+   ENABLE_ALPACA=1
+   ENABLE_ALPACA_REST=1
+   ENABLE_UNIVERSE_SEED=1
+   ALPACA_API_KEY_ID=...            # paper or live key
+   ALPACA_API_SECRET_KEY=...
+   FORECAST_HORIZON=5d
+   KRONOS_HORIZON_STEPS=5
+   FORECAST_MAX_TICKERS=150         # or whatever size you want
+   ```
+3. Launch the stack (ingest + Kronos + planners). This brings up Postgres/Redis automatically:
+   ```bash
+   docker compose build
+   docker compose up -d ingest kronos-nbeats forecast strategist worker policy api redis db
+   ```
+   Ingest seeds the `symbols` table with Alpaca’s `/v2/assets`, refreshes shortability flags, and streams trades/quotes. The forecast service now writes **5-day** Kronos signals into `forecasts` for every Alpaca equity (`FORECAST_MAX_TICKERS` per cycle).
+4. Confirm data is flowing:
+   ```bash
+   docker compose logs -f ingest
+   docker compose logs -f forecast
+   docker compose exec -T db psql -U pulse -d pulse -c "SELECT horizon, COUNT(*) FROM forecasts GROUP BY 1 ORDER BY 1"
+   ```
+
 ### After allocator fixes (October 2025)
 - The allocator now treats tiny long/short weights symmetrically (`libs/portfolio/sizer.py`), so lingering fractional shorts are covered instead of ignored and short books use the same normalization logic as longs.
 - Restart the stack after pulling this change so every service reloads the updated sizing logic:
@@ -37,6 +67,48 @@ This monorepo ships a minimal, production-lean trading research stack:
 
   (Expect the GPU Kronos services to report `health: starting` for ~30 seconds before they flip to `healthy`.)
 - Sanity-check policy with `docker compose logs -f policy | grep -i "sizer"` and confirm fills show net BUYs when flattening shorts.
+
+## Alpaca-Universe N-BEATS Pipeline (Sentiment + Price Targets)
+
+The research loop now ships a full pipeline to train Kronos N-BEATS on the entire Alpaca universe (≈3.4k symbols) with 6 months of price data, FMP sentiment, and v4 price targets:
+
+1. **Seed data** (ongoing ingest already writes the required tables; backfill with the new scripts if needed):
+   ```bash
+   python tools/fmp/backfill_sentiment.py --since 2023-01-01 --limit 500
+   python tools/fmp/backfill_price_targets_v4.py --since 2023-01-01 --limit 500
+   ```
+2. **Build the enriched training set**:
+   ```bash
+   python tools/kronos_data/build_alpaca_training_set.py \
+     --symbols db/alpaca_universe.symbols.txt \
+     --lookback-days 190 \
+     --out /mnt/data/kronos_data/processed/nbeats_alpaca_daily.parquet
+   ```
+3. **Train N-BEATS with covariates** (sentiment + targets):
+   ```bash
+   python tools/kronos_data/train_nbeats.py \
+     --data /mnt/data/kronos_data/processed/nbeats_alpaca_daily.parquet \
+     --out /mnt/data/models/kronos-nbeats \
+     --input-size 126 --horizon 5 --feature-cols "" \
+     --residuals-out /mnt/data/kronos_data/processed/nbeats_alpaca_residuals.parquet
+   ```
+4. **Rank the best-fit symbols** (Top 100 by validation residuals):
+   ```bash
+   python tools/kronos_data/rank_best_fit.py \
+     --residuals /mnt/data/kronos_data/processed/nbeats_alpaca_residuals.parquet \
+     --top-k 100 \
+     --report reports/top100_best_fit.json \
+     --update-file services/ingest/universe_symbols.txt
+   ```
+5. **One-shot orchestration** (runs all steps above):
+   ```bash
+   python tools/pipeline/train_nbeats_alpaca.py \
+     --symbols-file db/alpaca_universe.symbols.txt \
+     --lookback-days 190 --top-k 100 \
+     --update-universe services/ingest/universe_symbols.txt
+   ```
+
+The pipeline writes the enriched dataset, stores the trained Kronos artifact (under `/mnt/data/models/kronos-nbeats/<run-id>`), exports residuals for diagnosability, and refreshes `services/ingest/universe_symbols.txt` with the Top 100 best-fit names for allocators to consume. See `docs/Kronos_Models_Training_and_Datastreams.md` for feature engineering details.
 
 ### Short book controls (November 2025)
 
@@ -91,17 +163,17 @@ These GPU-ready microservices live alongside the core API. Each reads its artifa
 
 Health checks: `docker compose exec -T <service> curl -fsS http://localhost:<port>/health`
 
-## LLM service (“Lexi” via shared vLLM)
+## LLM service (“Finance” via shared vLLM)
 
-PulseTrade no longer ships an embedded vLLM container. Instead, all services call the shared “Lexi” instance running on the host (port `8008`) via `host.docker.internal`.
+PulseTrade no longer ships an embedded vLLM container. Instead, all services call the shared “Finance” instance running on the host (port `9009`) via `host.docker.internal`.
 
-- Launch Lexi separately (example):
+- Launch Finance separately (example):
 
   ```bash
   export CUDA_VISIBLE_DEVICES=0,1,2,3
   /mnt/data/vllm-venv/bin/python -m vllm.entrypoints.openai.api_server \
     --model /mnt/data/models/Qwen/Qwen2.5-32B-AGI \
-    --served-model-name Lexi \
+    --served-model-name Finance \
     --tensor-parallel-size 4 \
     --dtype float16 \
     --max-model-len 4096 \
@@ -112,12 +184,12 @@ PulseTrade no longer ships an embedded vLLM container. Instead, all services cal
     --trust-remote-code \
     --download-dir /mnt/data/models \
     --disable-custom-all-reduce \
-    --host 0.0.0.0 --port 8008
+    --host 0.0.0.0 --port 9009
   ```
 
 - Core services expect:
-  - `LLM_BASE_URL=http://host.docker.internal:8008/v1`
-  - `LLM_MODEL=Lexi`
+  - `LLM_BASE_URL=http://host.docker.internal:9009/v1`
+  - `LLM_MODEL=Finance`
   - `LLM_API_KEY` left blank (OpenAI-compatible but unauthenticated in this setup)
 - `docker-compose.yml` sets `extra_hosts` for API + Forecast so `host.docker.internal` resolves inside the containers.
 - Health check (proxy through API): `curl -s http://localhost:8001/llm/health`
@@ -127,6 +199,7 @@ Configuration still lives in `.env` / `.env.example`. The forecast service recor
 
 - Prompt registry: `configs/llm_prompts.yaml` tracks versioned templates. Use `LLM_AB_BUCKETS` to run A/B variants.
 - Audit trail: every call is persisted to `llm_calls` with latency, prompt hash, and success flag. `make migrate-llm` applies the schema.
+- Weekly deep dive & daily go/no-go: the Friday `tools/universe/build_signal_universe.py` run now calls the `weekly_deep_dive` prompt for the universe-100 and writes outputs to `llm_symbol_reviews` plus `reports/llm_weekly_deep_dive_<date>.json`. The nightly `tools/planner/build_daily_plans.py` adds a 48h `daily_go_nogo` sweep for the active-10, writes `reports/daily_llm_check_<date>.json`, and stores verdicts that policy uses as a kill switch at the open.
 - Admin endpoints: `GET /llm/admin/call/{id}`, `POST /llm/admin/replay`, `GET /llm/admin/stats`.
 - Offline eval: `make eval-llm` replays historical snapshots and writes latency/validity stats under `results/`.
 - Kill switch & panic controls: set `ORDER_GATE_DISABLED=true` to bypass LLM gating, and enable `ENABLE_PANIC_EXIT=1` to allow `POST /strategist/panic-exit` to place a global breaker and close open positions.
@@ -165,10 +238,10 @@ Drop it on a nightly cron after fills land; the Markdown statement is designed t
 
 We maintain layered universes inside Postgres:
 
-1. `symbols` table: ingestion superset.
-2. `daily_returns` / `mv_liquidity_60d` materialized view.
-3. `universe_candidates_daily`: ranks by liquidity/spread.
-4. `trading_universe_100`: top 100 tradable names used by the decision layer.
+1. `symbols` table: ingestion superset from Alpaca + side feeds.
+2. `mv_liquidity_60d`: materialized view with rolling liquidity statistics.
+3. `signal_universe_100`: **signal-ranked snapshot** written weekly via Kronos forecasts.
+4. `trading_universe_100`: view that points at the most recent `signal_universe_100` snapshot.
 
 Toggle the live trading universe in `.env`:
 
@@ -177,7 +250,119 @@ TRADING_UNIVERSE_VIEW=trading_universe_100
 ALLOW_EXIT_OUTSIDE_UNIVERSE=1
 ```
 
-At runtime `policy` logs the resolved view and tradable count. Update the view definitions in `db/migrations/20251023_top100_universe.sql` as your liquidity heuristics evolve.
+The signal universe builder lives in `tools/universe/build_signal_universe.py`. It pulls Alpaca-tradable equities, filters out OTC/inactive/<$3 names, requires a minimum 60d dollar volume, computes the Kronos 5-day excess Sharpe-like signal, runs the **LLM risk screen** (flags litigation/earnings/odd news) on the top candidates, demotes or drops anything risky, and writes the top `SIGNAL_UNIVERSE_SIZE` (default 100) into `signal_universe_100` with Kronos + LLM metadata. The same run refreshes `services/ingest/universe_symbols.txt` for fast ingest warm-start. Schedule it every Friday 11pm CST via:
+
+```bash
+docker compose run --rm tools \
+  bash -lc 'python tools/universe/build_signal_universe.py --as-of $(date +%F)'
+```
+
+If you want a one-stop “Step 1” job that backfills the prior week, invokes the Kronos forecaster, and writes the top 100 purely by signal-to-noise (no LLM/Monte Carlo yet), use:
+
+```bash
+docker compose run --rm tools \
+  bash -lc 'python tools/pipeline/run_weekly_predictability.py --as-of $(date +%F)'
+```
+
+That script now pulls candles from Finnhub first (`FINNHUB_API_KEY` required in `.env`) and only falls back to the Alpaca REST/liquidity backfills when Finnhub lacks coverage. After data prep it calls `forecast_once` for each symbol and upserts the predictability snapshot into `signal_universe_100` so downstream LLM + Monte Carlo stages can pick up a consistent universe.
+
+Once Step 1 is done, kick off the weekly LLM deep dive (Step 3) to attach agreement/neutral/disagreement signals before Monte Carlo:
+
+```bash
+docker compose run --rm tools \
+  bash -lc 'python tools/pipeline/run_weekly_deep_dive.py --as-of $(date +%F)'
+```
+
+This reuses the `run_weekly_deep_dives` helper so every top-100 symbol gets a structured review stored in `llm_symbol_reviews` plus `reports/llm_weekly_deep_dive_<date>.json`.
+
+Next (Step 4, optional), simulate the universe via Monte Carlo to surface the top trades for the coming session (set `ENABLE_MONTE_CARLO=1` or run manually when needed):
+
+```bash
+docker compose run --rm tools \
+  bash -lc 'python tools/pipeline/run_monte_carlo_top10.py --as-of $(date +%F)'
+```
+
+This script reuses `tools/universe/monte_carlo_sim.py`, writes the `universe_monte_carlo` table, and emits `reports/monte_carlo_top_trades_<date>.json` so the planner/policy can consume the certainty-weighted top 10 when the stage is enabled. With `ENABLE_MONTE_CARLO=0` (default), the weekly pipeline skips this step entirely and you can run the simulator later for research.
+
+Finally (Step 5), re-run the intraday go/no-go sweep to incorporate fresh headlines at 08:00 and 12:00 CST:
+
+```bash
+docker compose run --rm tools \
+  bash -lc 'python tools/pipeline/run_intraday_go_nogo.py --date $(date +%F) --slot 0800'
+```
+
+Repeat with `--slot 1200` at midday. This updates `llm_symbol_reviews` (scope `daily_go_nogo`) and writes `reports/daily_llm_check_<date>_<slot>.json`, allowing the policy service to block any symbols that became risky intraday.
+
+`trading_universe_100` automatically points at the most recent snapshot so planner/policy keep trading inside the “top 100 by forward edge” sandbox.
+
+### Monte Carlo ranking
+
+When enabled, `tools/universe/monte_carlo_sim.py` runs after the Kronos + LLM passes to enrich the universe. For each of the 100 ranked symbols we:
+
+- Pull the last `MONTE_CARLO_LOOKBACK_DAYS` worth of log returns from `daily_returns` (default 252) plus the latest `symbols.meta->last_price`.
+- Simulate `MONTE_CARLO_SIMS` geometric paths over `MONTE_CARLO_DAYS` (defaults 1,000 sims × 5 days) using the historical mean/std and record the per-symbol mean profit, profit std-dev, probability of finishing green, and the combined **best score** (`mean_profit / profit_std_dev`).
+- Persist the raw stats to `universe_monte_carlo` (with ranks) and embed a `"monte_carlo"` block into each `signal_universe_100.meta` row. JSON reports land under `reports/monte_carlo_universe_<as_of>.json` and `reports/monte_carlo_top10_<as_of>.json`.
+- Optionally push run-duration metrics to a Prometheus pushgateway (`PROM_PUSHGATEWAY`) so cron monitors can alert if the Monte Carlo stage stalls.
+- **TODO:** integrate live borrow-cost data (e.g., Alpaca stock borrow API) so short rankings subtract the actual borrow expense. For now the planner assumes a neutral borrow cost of 1.0.
+
+Planner + policy consume that metadata automatically when present:
+
+- The nightly planner can prioritize stocks by Monte Carlo best score before falling back to signal `delta`, and can use the Monte Carlo mean/std to seed its per-plan simulations when the data is available. Set `PLAN_FORECAST_HORIZON`, `MONTE_CARLO_*`, and `DAILY_CANDIDATE_COUNT` to tune the blend.
+- Policy can enforce `PT_REQUIRE_MONTE_TOP=true` (default false) to only open positions in the latest Monte Carlo top list. Set `PT_MONTE_TOP_LIMIT` (default 10) to choose the cutoff. Live metrics expose the overlap rate via the Prometheus gauge `policy_monte_top_overlap` (listens on `POLICY_METRICS_PORT`, default 9109).
+
+New DB migration: `db/migrations/20251120_add_monte_carlo_universe.sql` installs the `universe_monte_carlo` table—apply it before running the updated tooling.
+
+### Nightly daily-plan selection
+
+The nightly selector (`tools/planner/build_daily_plans.py`) consumes the weekly signal universe and picks the next trading day’s candidates:
+
+- Computes the latest vs. previous 5-day excess signal for each of the 100 names (`delta_signal`), blends in the LLM risk/sentiment metadata, and sets the daily actionability score (so nasty news/earnings get down-weighted before they ever reach Monte Carlo). Mandatory overnight holds are auto-included.
+- Calls the LLM “plan coach” to suggest an archetype per symbol (long/short intraday vs swing vs no-trade), then builds a single `DailyPlan` (≤2 actions) and runs Monte Carlo to estimate mean P&L, volatility, and probability of loss with 95% confidence bounds (configurable via env: `PLAN_EPS_MU`, `PLAN_EPS_P`, `PLAN_P_LOSS_MAX`, `PLAN_LAMBDA_RISK`).
+- Applies the safety gates (`p_loss_upper <= 0.45`, `mu_lower >= 0.0001`), ranks eligible plans by `score = mu - λ·sigma`, and keeps at most `DAILY_MAX_TRADES // MAX_ACTIONS_PER_STOCK_PER_DAY` symbols (defaults: 20 trades / 2 actions → ≤10 symbols).
+- Writes JSON + Markdown summaries under `reports/daily_plan_selection_YYYY-MM-DD.*`. The JSON contains every candidate’s plan + evaluation; the Markdown gives a quick human-readable list for tomorrow’s book review.
+
+Run it nightly (11pm CST Sun–Thu) via:
+
+```bash
+docker compose run --rm tools \
+  bash -lc 'python tools/planner/build_daily_plans.py --date $(date -d "tomorrow" +%F)'
+```
+
+Planner/policy can ingest the resulting JSON to know which symbols/plans are authorized for the next trading day, and enforce the global/per-symbol action caps directly.
+
+#### Automation helpers
+
+Invoke the recurring jobs directly via the tools runner (legacy shell wrappers remain under `scripts/scheduler` if you prefer them):
+
+```bash
+docker compose run --rm tools python -m tools.run signal-universe -- --as-of "$(TZ=America/Chicago date +%F)"
+docker compose run --rm tools python -m tools.run daily-plans -- --date "$(TZ=America/Chicago date +%F)"
+scripts/scheduler/run_liquidity_backfill.sh        # populates last_price + avg_dollar_vol_60d
+```
+
+Make targets offer the same behavior:
+
+```bash
+make liquidity.backfill       # optional env LIMIT / LOOKBACK_DAYS
+
+make signal.universe
+DATE=2025-11-15 make signal.universe
+
+make daily.plans
+DATE=2025-11-16 make daily.plans
+```
+
+Example cron entries (host timezone CST):
+
+```
+# Weekly universe snapshot (Friday 11pm CST)
+0 23 * * 5 TZ=America/Chicago docker compose -f /mnt/data/PulseTrade/docker-compose.yml run --rm tools \
+  python -m tools.run signal-universe >> /mnt/data/logs/signal_universe.log 2>&1
+
+# Nightly plans (Mon–Thu 11pm CST)
+0 23 * * 1-4 TZ=America/Chicago docker compose -f /mnt/data/PulseTrade/docker-compose.yml run --rm tools \
+  python -m tools.run daily-plans >> /mnt/data/logs/daily_plans.log 2>&1
+```
 
 ### Trading knobs and troubleshooting no-trade scenarios
 

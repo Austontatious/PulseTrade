@@ -24,3 +24,39 @@ services:
   strategist:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${STRATEGIST_GPU:-7}
+
+  tools:
+    command: ["python3", "-m", "tools.run"]
+    environment:
+      PYTHONPATH: /workspace
+      VLLM_HOST: "100.125.116.103"
+      VLLM_PORT: "9009"
+      LLM_BASE_URL: "http://100.125.116.103:9009/v1"
+      LLM_MODEL: "Finance"
+      FORECAST_UNIVERSE_FILE: /workspace/services/ingest/universe_symbols.txt
+    working_dir: /workspace
+
+  forecast:
+    environment:
+      FORECAST_UNIVERSE_FILE: /data/universe_symbols.txt
+    volumes:
+      - ./services/ingest/universe_symbols.txt:/data/universe_symbols.txt:ro
+
+  ingest:
+    environment:
+      ALPACA_REST_RPM: "30"
+      ALPACA_REST_BATCH: "20"
+      ALPACA_REST_BATCH_PAUSE_S: "5.0"
+      ALPACA_WS_DISABLE_EXTRA_LISTS: "1"
+      ALPACA_WS_SUB_CHUNK: "25"
+      ALPACA_WS_SUB_PAUSE_S: "3.0"
+      ALPACA_UNIVERSE_FILE: /app/ingest/universe_symbols.txt
+      VLLM_HOST: "100.125.116.103"
+      VLLM_PORT: "9009"
+      LLM_BASE_URL: "http://100.125.116.103:9009/v1"
+      LLM_MODEL: "Finance"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    volumes:
+      - ./services/ingest/universe_symbols.txt:/app/ingest/universe_symbols.txt:ro

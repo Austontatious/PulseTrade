@@ -16,6 +16,10 @@ from neuralforecast.losses.pytorch import MQLoss, sCRPS
 from neuralforecast.models import NBEATS
 from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor
 import torch
+try:
+    import torch.distributed as dist
+except ImportError:  # pragma: no cover - distributed not always compiled in.
+    dist = None
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -70,7 +74,14 @@ def _train_valid_split(df: pd.DataFrame, min_holdout_frac: float = 0.2, min_hold
     train = df.drop(index=val_indices).copy()
 
     if train.empty or valid.empty:
-        raise ValueError("Split produced an empty partition – check data coverage.")
+        print("[train_nbeats] primary split failed; falling back to global 80/20 split.")
+        ordered = df.sort_values(["unique_id", "ds"]).reset_index(drop=True)
+        split_idx = max(int(len(ordered) * (1 - min_holdout_frac)), 1)
+        split_idx = min(split_idx, len(ordered) - 1)
+        train = ordered.iloc[:split_idx].copy()
+        valid = ordered.iloc[split_idx:].copy()
+        if train.empty or valid.empty:
+            raise ValueError("Split produced an empty partition – check data coverage.")
 
     return SplitResult(train=train, valid=valid)
 
@@ -102,7 +113,7 @@ def _collect_quantile_columns(columns: Iterable[str], quantiles: Sequence[float]
     return mapping
 
 
-def _compute_metrics(preds: pd.DataFrame, valid: pd.DataFrame, quantiles: Sequence[float]) -> Dict[str, Optional[float]]:
+def _compute_metrics(preds: pd.DataFrame, valid: pd.DataFrame, quantiles: Sequence[float], horizons: Sequence[int]) -> Dict[str, Optional[float]]:
     metrics: Dict[str, Optional[float]] = {
         "val_mae_p50_h1": None,
         "val_coverage_p05_p95_h1": None,
@@ -143,7 +154,40 @@ def _compute_metrics(preds: pd.DataFrame, valid: pd.DataFrame, quantiles: Sequen
     except Exception:
         metrics["val_scrps"] = None
 
+    # window-specific MAE
+    max_ds = valid["ds"].max()
+    for horizon in horizons:
+        cutoff = max_ds - pd.Timedelta(days=horizon)
+        mask = aligned["ds"] >= cutoff
+        if not mask.any():
+            continue
+        mae = float((aligned.loc[mask, q50] - aligned.loc[mask, "y"]).abs().mean()) if q50 else None
+        metrics[f"val_mae_{horizon}d"] = mae
     return metrics
+
+
+def _merge_predictions(preds: pd.DataFrame, valid: pd.DataFrame, quantile_col: str) -> pd.DataFrame:
+    renamed = preds.rename(columns={quantile_col: "yhat"})
+    merged = renamed.merge(valid[["unique_id", "ds", "y"]], on=["unique_id", "ds"], how="inner")
+    merged["residual"] = merged["y"] - merged["yhat"]
+    merged["abs_error"] = merged["residual"].abs()
+    merged["direction_ok"] = np.sign(merged["y"]) == np.sign(merged["yhat"])
+    return merged
+
+
+def _ensure_unique_id_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Make sure prediction frames expose the id as a column, regardless of NF defaults."""
+    if "unique_id" in df.columns:
+        return df
+    reset = df.reset_index()
+    if "unique_id" not in reset.columns and reset.columns.size > 0:
+        first_col = reset.columns[0]
+        reset = reset.rename(columns={first_col: "unique_id"})
+    return reset
+
+
+def _is_distributed_nonzero_rank() -> bool:
+    return bool(dist) and dist.is_available() and dist.is_initialized() and dist.get_rank() != 0
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -158,6 +202,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patience", type=int, default=6, help="Early stopping patience (epochs).")
     parser.add_argument("--scheduler-patience", type=int, default=3, help="ReduceLROnPlateau patience.")
     parser.add_argument("--min-lr", type=float, default=1e-5, help="Lower bound for LR scheduler.")
+    parser.add_argument("--feature-cols", type=str, default="", help="Comma-separated covariate columns (default: all extras).")
+    parser.add_argument("--metrics-horizons", type=str, default="30,60,90", help="Comma-separated holdout windows in days.")
+    parser.add_argument("--residuals-out", type=Path, default=None, help="Optional path to store residuals parquet.")
+    parser.add_argument("--min-holdout-days", type=int, default=365, help="Minimum days reserved for validation per symbol.")
+    parser.add_argument("--min-holdout-frac", type=float, default=0.2, help="Minimum fraction reserved for validation per symbol.")
+    parser.add_argument("--devices", type=str, default="1", help="Devices for Lightning trainer (e.g., '1' or 'auto').")
+    parser.add_argument(
+        "--start-padding",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Control start-of-series zero padding when histories are shorter than the input window (default: auto).",
+    )
     return parser
 
 
@@ -174,8 +230,32 @@ def main() -> None:
         raise SystemExit("Training data is empty.")
 
     df["ds"] = pd.to_datetime(df["ds"])
-    split = _train_valid_split(df)
+    base_cols = {"unique_id", "ds", "y"}
+    extra_cols = [col for col in df.columns if col not in base_cols]
+    feature_cols = [c.strip() for c in args.feature_cols.split(",") if c.strip()] if args.feature_cols else extra_cols
+    if feature_cols:
+        print("[train_nbeats] Covariate columns specified but will be ignored with current NeuralForecast version.")
+    split = _train_valid_split(df, min_holdout_frac=args.min_holdout_frac, min_holdout_days=args.min_holdout_days)
     train_df, valid_df = split.train, split.valid
+
+    train_counts = train_df.groupby("unique_id").size()
+    if train_counts.empty:
+        raise SystemExit("Training split produced no rows.")
+    min_train_len = int(train_counts.min())
+    required_window = args.input_size + args.horizon
+    start_padding_enabled = args.start_padding == "on"
+    if args.start_padding == "auto":
+        if min_train_len < required_window:
+            start_padding_enabled = True
+            print(
+                f"[train_nbeats] Shortest training series has {min_train_len} rows (< {required_window}); "
+                "enabling start padding to avoid window errors."
+            )
+    elif args.start_padding == "off" and min_train_len < required_window:
+        print(
+            f"[train_nbeats] WARNING: start padding disabled but the shortest training series has only "
+            f"{min_train_len} rows (< {required_window}). Training may fail."
+        )
 
     callbacks = [
         EarlyStopping(monitor="train_loss", patience=args.patience, min_delta=1e-4, mode="min"),
@@ -194,6 +274,7 @@ def main() -> None:
         h=args.horizon,
         loss=MQLoss(quantiles=quantiles_list),
         dropout_prob_theta=dropout,
+        start_padding_enabled=start_padding_enabled,
         optimizer=AdamW,
         optimizer_kwargs={"weight_decay": args.weight_decay},
         lr_scheduler=ReduceLROnPlateau,
@@ -208,21 +289,47 @@ def main() -> None:
     default_root = args.out / "_lightning"
     default_root.mkdir(parents=True, exist_ok=True)
 
+    devices_arg = str(args.devices).strip().lower()
     trainer_kwargs = dict(
         max_epochs=args.max_epochs,
         enable_checkpointing=False,
         accelerator="auto",
-        devices="auto",
+        devices=args.devices,
         log_every_n_steps=50,
         gradient_clip_val=1.0,
         callbacks=callbacks,
         default_root_dir=str(default_root),
     )
+    predict_trainer_kwargs = dict(trainer_kwargs)
+    predict_trainer_kwargs.pop("strategy", None)
+    predict_trainer_kwargs["devices"] = 1
+    if devices_arg == "cpu" or not torch.cuda.is_available():
+        predict_trainer_kwargs["accelerator"] = "cpu"
+    else:
+        predict_trainer_kwargs["accelerator"] = "gpu"
+    multi_device_training = False
+    try:
+        multi_device_training = devices_arg not in {"auto", "cpu"} and int(devices_arg) > 1
+    except ValueError:
+        multi_device_training = devices_arg not in {"auto", "cpu", "1"}
+    if devices_arg == "auto":
+        multi_device_training = torch.cuda.device_count() > 1
+    if multi_device_training:
+        print("[train_nbeats] Using single-device inference to avoid multi-GPU predict issues.")
 
     model.trainer_kwargs = trainer_kwargs
     nf = NeuralForecast(models=[model], freq="D")
     nf.fit(df=train_df, verbose=False)
-    predictions = nf.predict()
+    if _is_distributed_nonzero_rank():
+        if dist:
+            print(f"[train_nbeats] Rank {dist.get_rank()} finished training; skipping post-processing.")
+        return
+    for fitted in nf.models:
+        fitted.trainer_kwargs = predict_trainer_kwargs
+    predictions_raw = nf.predict()
+    if hasattr(predictions_raw, "to_pandas"):
+        predictions_raw = predictions_raw.to_pandas()
+    predictions = _ensure_unique_id_column(pd.DataFrame(predictions_raw))
     eval_df = (
         valid_df.groupby("unique_id", group_keys=False)
         .head(args.horizon)
@@ -233,7 +340,31 @@ def main() -> None:
     artifact_dir = args.out / artifact_id
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    metrics = _compute_metrics(predictions, eval_df, QUANTILES)
+    try:
+        horizons = [int(h.strip()) for h in args.metrics_horizons.split(",") if h.strip()]
+    except ValueError:
+        horizons = [30, 60, 90]
+    metrics = _compute_metrics(predictions, eval_df, QUANTILES, horizons)
+    q_cols = _collect_quantile_columns(predictions.columns, QUANTILES)
+    q50_col = q_cols.get(0.5) or q_cols.get(0.50)
+    residuals_path: Optional[Path] = None
+    if q50_col:
+        merged = _merge_predictions(predictions[["unique_id", "ds", q50_col]], valid_df, q50_col)
+        if not merged.empty:
+            chunks: List[pd.DataFrame] = []
+            max_ds = merged["ds"].max()
+            for horizon in horizons:
+                cutoff = max_ds - pd.Timedelta(days=horizon)
+                chunk = merged[merged["ds"] >= cutoff].copy()
+                chunk["window"] = f"{horizon}d"
+                chunks.append(chunk)
+            if chunks:
+                residuals = pd.concat(chunks, ignore_index=True)
+                residuals.sort_values(["unique_id", "ds", "window"], inplace=True)
+                residuals_path = args.residuals_out or (artifact_dir / "residuals.parquet")
+                residuals_path.parent.mkdir(parents=True, exist_ok=True)
+                residuals.to_parquet(residuals_path, index=False)
+                metrics["residuals_path"] = str(residuals_path)
     config = {
         "model_name": "nbeats",
         "loss": "MQLoss",
@@ -243,6 +374,10 @@ def main() -> None:
         "h": args.horizon,
         "dropout": dropout,
         "weight_decay": args.weight_decay,
+        "start_padding_mode": args.start_padding,
+        "start_padding_enabled": start_padding_enabled,
+        "required_train_window": required_window,
+        "shortest_train_series": min_train_len,
         "max_epochs": args.max_epochs,
         "patience": args.patience,
         "scheduler_patience": args.scheduler_patience,
@@ -256,6 +391,7 @@ def main() -> None:
             "max": str(valid_df["ds"].max()),
         },
         "metrics": metrics,
+        "features": feature_cols,
     }
 
     with (artifact_dir / "config.json").open("w", encoding="utf-8") as handle:
@@ -268,7 +404,8 @@ def main() -> None:
         "model_hparams": {
             "input_size": args.input_size,
             "h": args.horizon,
-        "quantiles": quantiles_list,
+            "quantiles": quantiles_list,
+            "feature_cols": feature_cols,
         },
         "state_dict": nf.models[0].state_dict(),
     }
@@ -286,6 +423,8 @@ def main() -> None:
     with (artifact_dir / "VERSION").open("w", encoding="utf-8") as handle:
         handle.write(artifact_id)
 
+    if residuals_path:
+        print("Residuals written to:", residuals_path)
     print("Artifact ready at:", artifact_dir)
 
 

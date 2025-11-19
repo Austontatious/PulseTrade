@@ -1,12 +1,24 @@
+import logging
 import os
 import re
+
 import asyncpg
-from .executor import maybe_submit_order, get_open_orders, get_all_positions, close_position
+
+from .executor import (
+    cancel_orders_for_symbol,
+    close_position,
+    get_all_positions,
+    get_open_orders,
+    maybe_submit_order,
+)
 
 DB_DSN = (
     f"postgresql://{os.getenv('POSTGRES_USER', 'pulse')}:{os.getenv('POSTGRES_PASSWORD', 'pulsepass')}@"
     f"{os.getenv('POSTGRES_HOST', 'db')}:{os.getenv('POSTGRES_PORT', '5432')}/{os.getenv('POSTGRES_DB', 'pulse')}"
 )
+USE_TRAILING_STOPS = os.getenv("PT_USE_TRAILING_STOPS", "true").lower() == "true"
+logger = logging.getLogger(__name__)
+
 
 async def place_fractional_exits(conn: asyncpg.Connection) -> int:
     # Find recent planner fills with Alpaca ack and no bracket (qty < 1)
@@ -26,28 +38,33 @@ async def place_fractional_exits(conn: asyncpg.Connection) -> int:
     )
     placed = 0
     for r in rows:
-        tkr = r["ticker"]; side = r["side"]; qty = float(r["qty"]) or 0.0
-        if side != 'buy' or qty <= 0:
+        tkr = r["ticker"]
+        side = r["side"]
+        qty = float(r["qty"]) or 0.0
+        if side != "buy" or qty <= 0:
             continue
         try:
             opens = await get_open_orders(tkr)
-            has_tp = any(o.get('side') == 'sell' and o.get('type') == 'limit' for o in opens)
-            has_sl = any(o.get('side') == 'sell' and o.get('type') in ('stop','stop_limit') for o in opens)
+            has_tp = any(o.get("side") == "sell" and o.get("type") == "limit" for o in opens)
+            has_sl = any(o.get("side") == "sell" and o.get("type") in ("stop", "stop_limit") for o in opens)
             if not has_tp and r["target"]:
-                await maybe_submit_order(tkr, 'sell', qty, limit_price=float(r['target']), order_type='limit')
+                await maybe_submit_order(tkr, "sell", qty, limit_price=float(r["target"]), order_type="limit")
                 placed += 1
             if not has_sl and r["stop"]:
-                await maybe_submit_order(tkr, 'sell', qty, order_type='stop', stop_price=float(r['stop']))
+                await maybe_submit_order(tkr, "sell", qty, order_type="stop", stop_price=float(r["stop"]))
                 placed += 1
-        except Exception:
+        except Exception as exc:
+            logger.warning("fractional exit placement failed for %s: %s", tkr, exc)
             continue
     return placed
+
 
 async def run_exit_manager_once() -> int:
     conn = await asyncpg.connect(dsn=DB_DSN)
     try:
         placed = 0
-        placed += await place_fractional_exits(conn)
+        if not USE_TRAILING_STOPS:
+            placed += await place_fractional_exits(conn)
         placed += await place_universe_exits(conn)
         return placed
     finally:
@@ -68,7 +85,6 @@ async def place_universe_exits(conn: asyncpg.Connection) -> int:
         return 0
 
     view = os.getenv("TRADING_UNIVERSE_VIEW", "trading_universe_100")
-    # basic identifier validation to avoid injection if env is modified
     if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", view):
         view = "trading_universe_100"
 
@@ -83,17 +99,16 @@ async def place_universe_exits(conn: asyncpg.Connection) -> int:
     for p in positions:
         try:
             tkr = (p.get("symbol") or "").upper()
-            if not tkr:
+            if not tkr or tkr.endswith("USD") or tkr in tradable:
                 continue
-            # Skip crypto pairs (managed by separate logic/universe)
-            if tkr.endswith("USD"):
-                continue
-            if tkr in tradable:
-                continue
-            # Close by API to avoid qty precision issues on fractional positions
-            resp = await close_position(tkr)
+            cancelled = await cancel_orders_for_symbol(tkr)
+            if cancelled:
+                logger.info("exit_manager: cancelled %s open orders for %s", cancelled, tkr)
+            resp = await close_position(tkr, cancel_orders=False)
             if resp is not None:
                 placed += 1
-        except Exception:
+                logger.info("exit_manager: flattened %s outside of universe", tkr)
+        except Exception as exc:
+            logger.warning("exit_manager: failed to flatten %s: %s", p.get("symbol"), exc)
             continue
     return placed

@@ -1,19 +1,38 @@
 import asyncio
 import asyncpg
+import datetime as dt
 import json
 import logging
 import math
 import os
 import time
+from httpx import HTTPStatusError
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+try:
+    from prometheus_client import Gauge, start_http_server  # type: ignore
+except Exception:  # pragma: no cover - fallback when prometheus_client missing
+    Gauge = None  # type: ignore
+
+    def start_http_server(*_args, **_kwargs):  # type: ignore
+        return None
 
 from libs.broker import alpaca_client as alp
 from libs.portfolio.allocator import Idea, propose_target_weights_long_short
 from libs.portfolio.replacement import replacement_plan
 from libs.portfolio.sizer import cash_after_orders, split_buys_and_sells, to_orders
+from libs.planner.daily_plan_loader import LoadedDailyPlan, load_daily_plans
 
-from .executor import ALPACA_TIF, get_account, get_all_positions, maybe_submit_order
+from .executor import (
+    ALPACA_TIF,
+    get_account,
+    get_all_positions,
+    get_open_orders,
+    maybe_submit_order,
+)
 from .exit_manager import run_exit_manager_once
 
 DB_DSN = (
@@ -43,10 +62,33 @@ CFG = {
     "trail_pct": float(os.getenv("PT_TRAIL_BUY_TO_COVER_PCT", "0.02")),
 }
 
+MAX_ACTIONS_PER_STOCK_PER_DAY = int(os.getenv("MAX_ACTIONS_PER_STOCK_PER_DAY", "2"))
+DAILY_MAX_TRADES = int(os.getenv("DAILY_MAX_TRADES", "20"))
+DAILY_PLAN_DIR = Path(os.getenv("DAILY_PLAN_DIR", "reports"))
+DAILY_PLAN_MODE = os.getenv("DAILY_PLAN_ENFORCEMENT", "off").strip().lower()
+NY_TZ = ZoneInfo("America/New_York")
+PT_REQUIRE_MONTE_TOP = os.getenv("PT_REQUIRE_MONTE_TOP", "false").lower() == "true"
+PT_MONTE_TOP_LIMIT = int(os.getenv("PT_MONTE_TOP_LIMIT", "10"))
+MONTE_ENABLED = os.getenv("ENABLE_MONTE_CARLO", "0").strip().lower() not in {"0", "false", "off", "no"}
+EFFECTIVE_REQUIRE_MONTE_TOP = PT_REQUIRE_MONTE_TOP and MONTE_ENABLED
+POLICY_METRICS_PORT = int(os.getenv("POLICY_METRICS_PORT", "9109"))
+LLM_GO_NOGO_SCOPE = "daily_go_nogo"
+
+_ACTIVE_DAILY_PLANS: Dict[str, LoadedDailyPlan] = {}
+_PLAN_ACTIONS_USED: Dict[str, int] = {}
+_PLAN_DATE: Optional[dt.date] = None
+_TRADE_COUNT_DATE: Optional[dt.date] = None
+_TOTAL_TRADES_TODAY = 0
+_MONTE_TOP_SYMBOLS: set[str] = set()
+_MONTE_TRADE_TOTAL = 0
+_MONTE_TRADE_TOP = 0
+
 logger = logging.getLogger(__name__)
 SHORT_REJECT_COOLDOWN_SECS = 600
 _SHORT_COOLDOWNS: Dict[str, float] = {}
 _SHORTABLE_CACHE: Dict[str, Tuple[bool, bool]] = {}
+_ASSET_STATUS_CACHE: Dict[str, Tuple[bool, float]] = {}
+_ASSET_CACHE_TTL_SECS = 900.0
 
 PT_BLOCK_IF_LLM_DENY = os.getenv("PT_BLOCK_IF_LLM_DENY", "true").lower() == "true"
 PT_SCORE_FIELD = os.getenv("PT_SCORE_FIELD", "signal_value_z")
@@ -57,6 +99,21 @@ ALPACA_TRADE_TICKERS = set(
     t.strip().upper() for t in os.getenv("ALPACA_SYMBOLS", "").split(",") if t.strip()
 )
 ALLOW_ALL = os.getenv("POLICY_ALLOW_ALL_ALPACA", "0") == "1"
+if PT_REQUIRE_MONTE_TOP and not MONTE_ENABLED:
+    logger.warning("PT_REQUIRE_MONTE_TOP is enabled but ENABLE_MONTE_CARLO=0; ignoring Monte gate.")
+if Gauge is not None and MONTE_ENABLED:
+    try:
+        start_http_server(POLICY_METRICS_PORT)
+    except Exception:
+        logger.warning("Policy metrics server failed to start on port %s", POLICY_METRICS_PORT)
+        MONTE_OVERLAP_GAUGE = None
+    else:
+        MONTE_OVERLAP_GAUGE = Gauge(
+            "policy_monte_top_overlap",
+            "Share of trades that overlap the Monte Carlo top list",
+        )
+else:
+    MONTE_OVERLAP_GAUGE = None
 
 
 @dataclass
@@ -102,6 +159,74 @@ def _mark_short_reject(symbol: str) -> None:
 async def _call_blocking(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
+
+def _parse_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _fetch_monte_carlo_map(conn: asyncpg.Connection) -> Dict[str, Dict[str, Any]]:
+    rows = await conn.fetch(
+        """
+        SELECT symbol, mean_profit, profit_std_dev, best_score, rank,
+               mean_return, return_std_dev
+        FROM universe_monte_carlo
+        WHERE as_of = (SELECT MAX(as_of) FROM universe_monte_carlo)
+        """
+    )
+    data: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        sym = (row["symbol"] or "").upper()
+        if not sym:
+            continue
+        data[sym] = {
+            "mean_profit": float(row["mean_profit"] or 0.0),
+            "profit_std_dev": float(row["profit_std_dev"] or 0.0),
+            "best_score": float(row["best_score"] or 0.0),
+            "rank": int(row["rank"] or 0) if row["rank"] is not None else None,
+            "mean_return": float(row["mean_return"] or 0.0),
+            "return_std_dev": float(row["return_std_dev"] or 0.0),
+        }
+    return data
+
+
+def _update_monte_top_symbols(monte_map: Dict[str, Dict[str, Any]]) -> None:
+    global _MONTE_TOP_SYMBOLS
+    if not MONTE_ENABLED or not monte_map:
+        _MONTE_TOP_SYMBOLS = set()
+        return
+    limit = max(PT_MONTE_TOP_LIMIT, 1)
+    _MONTE_TOP_SYMBOLS = {
+        sym for sym, info in monte_map.items() if info.get("rank") and info["rank"] <= limit
+    }
+
+
+async def _is_symbol_active(symbol: str) -> bool:
+    now = time.time()
+    cached = _ASSET_STATUS_CACHE.get(symbol)
+    if cached and (now - cached[1]) < _ASSET_CACHE_TTL_SECS:
+        return cached[0]
+    active = False
+    try:
+        info = await _call_blocking(alp.get_asset, symbol)
+    except HTTPStatusError as exc:
+        logger.warning(
+            "alpaca asset lookup failed for %s: %s %s",
+            symbol,
+            exc.response.status_code if exc.response else "n/a",
+            exc.response.text if exc.response else "",
+        )
+    except Exception as exc:
+        logger.warning("alpaca asset lookup failed for %s: %s", symbol, exc)
+    else:
+        status = str(info.get("status") or "").lower()
+        tradable = bool(info.get("tradable", True))
+        active = (status == "active") and tradable
+    _ASSET_STATUS_CACHE[symbol] = (active, now)
+    return active
 
 
 async def _fetch_price_map(conn: asyncpg.Connection) -> Dict[str, float]:
@@ -153,6 +278,29 @@ async def _fetch_fundamentals(conn: asyncpg.Connection) -> Dict[str, Dict[str, A
     return fundamentals
 
 
+async def _fetch_daily_go_nogo(conn: asyncpg.Connection, trading_date: dt.date) -> Dict[str, Dict[str, Any]]:
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT symbol, output_json
+            FROM llm_symbol_reviews
+            WHERE scope=$1 AND as_of=$2
+            """,
+            LLM_GO_NOGO_SCOPE,
+            trading_date,
+        )
+    except Exception:
+        return {}
+    mapping: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        sym = (row["symbol"] or "").upper()
+        if not sym:
+            continue
+        payload = row["output_json"] or {}
+        mapping[sym] = payload
+    return mapping
+
+
 def _llm_allow_from_features(features: Dict[str, Any]) -> bool:
     llm = features.get("llm") if isinstance(features, dict) else {}
     if isinstance(llm, dict):
@@ -180,6 +328,159 @@ def _score_from_features(features: Dict[str, Any], score_field: str) -> float | 
         return None
 
 
+def _position_available_qty(pos: Dict[str, float] | None) -> float:
+    if not pos:
+        return 0.0
+    held = abs(float(pos.get("qty_held_for_orders", 0.0)))
+    raw_available = pos.get("qty_available")
+    if raw_available is not None:
+        try:
+            available = abs(float(raw_available))
+        except (TypeError, ValueError):
+            available = abs(float(pos.get("shares", 0.0)))
+    else:
+        available = abs(float(pos.get("shares", 0.0)))
+    return max(available - held, 0.0)
+
+
+def _nyc_now() -> dt.datetime:
+    return dt.datetime.now(NY_TZ)
+
+
+def _current_trading_date() -> dt.date:
+    return _nyc_now().date()
+
+
+def _reset_trade_counters_if_needed(trading_date: dt.date) -> None:
+    global _TRADE_COUNT_DATE, _TOTAL_TRADES_TODAY, _MONTE_TRADE_TOTAL, _MONTE_TRADE_TOP
+    if _TRADE_COUNT_DATE != trading_date:
+        _TRADE_COUNT_DATE = trading_date
+        _TOTAL_TRADES_TODAY = 0
+        if MONTE_ENABLED:
+            _MONTE_TRADE_TOTAL = 0
+            _MONTE_TRADE_TOP = 0
+        if MONTE_OVERLAP_GAUGE is not None:
+            MONTE_OVERLAP_GAUGE.set(0.0)
+        if DAILY_PLAN_MODE != "off" and _PLAN_ACTIONS_USED:
+            for key in list(_PLAN_ACTIONS_USED.keys()):
+                _PLAN_ACTIONS_USED[key] = 0
+
+
+def _refresh_daily_plan_state() -> None:
+    trading_date = _current_trading_date()
+    _reset_trade_counters_if_needed(trading_date)
+    if DAILY_PLAN_MODE == "off":
+        return
+    global _PLAN_DATE, _ACTIVE_DAILY_PLANS, _PLAN_ACTIONS_USED
+    if _PLAN_DATE == trading_date and _ACTIVE_DAILY_PLANS:
+        return
+    plans = load_daily_plans(DAILY_PLAN_DIR, trading_date)
+    if not plans:
+        if _ACTIVE_DAILY_PLANS:
+            logger.warning("Daily plans missing for %s; disabling new entries", trading_date)
+        _ACTIVE_DAILY_PLANS = {}
+        _PLAN_ACTIONS_USED = {}
+        _PLAN_DATE = trading_date
+        return
+    _ACTIVE_DAILY_PLANS = {sym.upper(): plan for sym, plan in plans.items()}
+    _PLAN_ACTIONS_USED = {sym: 0 for sym in _ACTIVE_DAILY_PLANS}
+    _PLAN_DATE = trading_date
+    logger.info("Loaded %s daily plans for %s", len(_ACTIVE_DAILY_PLANS), trading_date)
+
+
+def _within_window(action, now: dt.datetime) -> bool:
+    t = now.time()
+    if action.start <= action.end:
+        return action.start <= t <= action.end
+    return t >= action.start or t <= action.end
+
+
+def _has_trade_capacity(symbol: str, is_exit: bool) -> bool:
+    if DAILY_MAX_TRADES <= 0:
+        return True
+    if _TOTAL_TRADES_TODAY < DAILY_MAX_TRADES:
+        return True
+    msg = f"daily trade cap reached ({_TOTAL_TRADES_TODAY}/{DAILY_MAX_TRADES}) for {symbol}"
+    if is_exit:
+        logger.info("%s; allowing exit", msg)
+        return True
+    if DAILY_PLAN_MODE == "shadow":
+        logger.info("daily plan shadow allow: %s", msg)
+        return True
+    logger.info("daily plan block: %s", msg)
+    return False
+
+
+def _allow_daily_plan(symbol: str, direction: str, *, is_entry: bool, is_exit: bool, reason: str) -> bool:
+    if DAILY_PLAN_MODE == "off":
+        return True
+    plan = _ACTIVE_DAILY_PLANS.get(symbol.upper())
+    if not plan:
+        if is_exit:
+            return True
+        msg = f"no active plan for {symbol} ({reason})"
+        if DAILY_PLAN_MODE == "shadow":
+            logger.info("daily plan shadow allow: %s", msg)
+            return True
+        logger.info("daily plan block: %s", msg)
+        return False
+    idx = _PLAN_ACTIONS_USED.get(symbol.upper(), 0)
+    if idx >= MAX_ACTIONS_PER_STOCK_PER_DAY or idx >= len(plan.actions):
+        msg = f"plan action limit reached for {symbol} ({idx} used)"
+        if DAILY_PLAN_MODE == "shadow":
+            logger.info("daily plan shadow allow: %s", msg)
+            return True
+        logger.info("daily plan block: %s", msg)
+        return False
+    action = plan.actions[idx]
+    now_et = _nyc_now()
+    if action.direction.lower() != direction.lower():
+        msg = f"next plan action for {symbol} expects {action.direction} (got {direction})"
+        if DAILY_PLAN_MODE == "shadow":
+            logger.info("daily plan shadow allow: %s", msg)
+            return True
+        logger.info("daily plan block: %s", msg)
+        return False
+    if not _within_window(action, now_et):
+        msg = (
+            f"outside plan window {action.window_label} for {symbol} "
+            f"(time {now_et.timetz().isoformat(timespec='minutes')})"
+        )
+        if DAILY_PLAN_MODE == "shadow":
+            logger.info("daily plan shadow allow: %s", msg)
+            return True
+        logger.info("daily plan block: %s", msg)
+        return False
+    return True
+
+
+def _should_execute_order(symbol: str, direction: str, *, is_entry: bool, is_exit: bool, reason: str) -> bool:
+    if not _has_trade_capacity(symbol, is_exit):
+        return False
+    if not _allow_daily_plan(symbol, direction, is_entry=is_entry, is_exit=is_exit, reason=reason):
+        return False
+    return True
+
+
+def _record_trade(symbol: str) -> None:
+    global _TOTAL_TRADES_TODAY, _MONTE_TRADE_TOTAL, _MONTE_TRADE_TOP
+    _TOTAL_TRADES_TODAY += 1
+    if MONTE_ENABLED:
+        _MONTE_TRADE_TOTAL += 1
+        if symbol.upper() in _MONTE_TOP_SYMBOLS:
+            _MONTE_TRADE_TOP += 1
+        if MONTE_OVERLAP_GAUGE is not None and _MONTE_TRADE_TOTAL > 0:
+            MONTE_OVERLAP_GAUGE.set(_MONTE_TRADE_TOP / max(_MONTE_TRADE_TOTAL, 1))
+    if DAILY_PLAN_MODE == "off":
+        return
+    sym = symbol.upper()
+    if sym in _PLAN_ACTIONS_USED:
+        _PLAN_ACTIONS_USED[sym] = min(
+            MAX_ACTIONS_PER_STOCK_PER_DAY,
+            _PLAN_ACTIONS_USED.get(sym, 0) + 1,
+        )
+
+
 async def build_state(conn: asyncpg.Connection) -> PortfolioState | None:
     account = await get_account()
     account_id = (account.get("id") or "").strip()
@@ -192,8 +493,20 @@ async def build_state(conn: asyncpg.Connection) -> PortfolioState | None:
             )
     positions_raw = await get_all_positions()
 
-    price_map = await _fetch_price_map(conn)
-    fundamentals = await _fetch_fundamentals(conn)
+    if MONTE_ENABLED:
+        price_map, fundamentals, monte_map = await asyncio.gather(
+            _fetch_price_map(conn),
+            _fetch_fundamentals(conn),
+            _fetch_monte_carlo_map(conn),
+        )
+        _update_monte_top_symbols(monte_map)
+    else:
+        price_map, fundamentals = await asyncio.gather(
+            _fetch_price_map(conn),
+            _fetch_fundamentals(conn),
+        )
+        monte_map = {}
+        _update_monte_top_symbols(monte_map)
 
     nav = float(account.get("portfolio_value", 0.0) or 0.0)
     cash = float(account.get("cash", 0.0) or 0.0)
@@ -204,15 +517,19 @@ async def build_state(conn: asyncpg.Connection) -> PortfolioState | None:
         sym = (entry.get("symbol") or "").upper()
         if not sym:
             continue
-        shares = float(entry.get("qty") or entry.get("quantity") or 0.0)
-        market_val = float(entry.get("market_value") or 0.0)
+        shares = _parse_float(entry.get("qty") or entry.get("quantity") or 0.0)
+        market_val = _parse_float(entry.get("market_value") or 0.0)
         weight = 0.0
         if nav > 0:
             weight = market_val / nav
+        qty_available = _parse_float(entry.get("qty_available") or entry.get("qty") or 0.0)
+        qty_held = _parse_float(entry.get("qty_held_for_orders") or 0.0)
         positions[sym] = {
             "shares": shares,
             "weight": weight,
             "market_value": market_val,
+            "qty_available": qty_available,
+            "qty_held_for_orders": qty_held,
         }
         total_market_value += abs(market_val)
         px = price_map.get(sym) or float(entry.get("current_price") or entry.get("avg_entry_price") or 0.0)
@@ -232,6 +549,7 @@ async def build_state(conn: asyncpg.Connection) -> PortfolioState | None:
         ORDER BY ticker, ts DESC
         """
     )
+    go_nogo_map = await _fetch_daily_go_nogo(conn, _current_trading_date())
 
     signals: List[Dict[str, Any]] = []
     for row in rows:
@@ -254,15 +572,24 @@ async def build_state(conn: asyncpg.Connection) -> PortfolioState | None:
         if score is None:
             mean = float(row["mean"] or 0.0)
             score = (mean / price) - 1.0
-        signals.append(
-            {
-                "symbol": sym,
-                "price": price,
-                "score": float(score),
-                "llm_policy_allow": allow,
-                "features": features,
-            }
-        )
+        go_decision = go_nogo_map.get(sym)
+        if go_decision:
+            allow = allow and bool(go_decision.get("go", True))
+        signal_entry = {
+            "symbol": sym,
+            "price": price,
+            "score": float(score),
+            "llm_policy_allow": allow,
+            "features": features,
+        }
+        if go_decision:
+            signal_entry["llm_go_nogo"] = go_decision
+        if MONTE_ENABLED:
+            monte_info = monte_map.get(sym)
+            if monte_info:
+                features["monte_carlo_score"] = monte_info.get("best_score")
+                signal_entry["monte_carlo"] = monte_info
+        signals.append(signal_entry)
 
     if not price_map:
         return None
@@ -290,6 +617,11 @@ def build_ideas(state: PortfolioState) -> List[Idea]:
         allow = bool(signal.get("llm_policy_allow", True))
         if not PT_BLOCK_IF_LLM_DENY:
             allow = True
+        monte_info = signal.get("monte_carlo") or {}
+        if EFFECTIVE_REQUIRE_MONTE_TOP:
+            rank = monte_info.get("rank")
+            if not rank or rank > PT_MONTE_TOP_LIMIT:
+                continue
         score = float(signal.get("score", 0.0))
         ideas.append(
             Idea(
@@ -336,6 +668,7 @@ def _combine_orders(orders: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
 
 
 async def rebalance_once(conn: asyncpg.Connection) -> None:
+    _refresh_daily_plan_state()
     state = await build_state(conn)
     if not state or state.nav <= 0:
         return
@@ -372,11 +705,23 @@ async def rebalance_once(conn: asyncpg.Connection) -> None:
 
     filtered: List[Tuple[str, int]] = []
     for sym, delta in orders:
-        if delta > 0:
-            if ALLOW_ALL or sym in ALPACA_TRADE_TICKERS or not sym.endswith("USD"):
-                filtered.append((sym, delta))
-        else:
-            filtered.append((sym, delta))
+        cur_pos = state.positions.get(sym, {})
+        cur_shares = float(cur_pos.get("shares", 0.0))
+        is_short = cur_shares < -1e-6
+        is_long = cur_shares > 1e-6
+        opens_long = delta > 0 and not is_short
+        opens_short = delta < 0 and not is_long
+
+        if opens_long and not (ALLOW_ALL or sym in ALPACA_TRADE_TICKERS or not sym.endswith("USD")):
+            continue
+
+        if (opens_long or opens_short):
+            active = await _is_symbol_active(sym)
+            if not active:
+                logger.info("skip %s order %s (alpaca asset inactive)", sym, delta)
+                continue
+
+        filtered.append((sym, delta))
     orders = filtered
 
     orders = _combine_orders(orders)
@@ -502,7 +847,10 @@ async def rebalance_once(conn: asyncpg.Connection) -> None:
         short_extra = sell_qty - close_qty
 
         if close_qty > 0:
+            if not _should_execute_order(sym, "sell", is_entry=False, is_exit=True, reason="close_long"):
+                continue
             await _submit_market(sym, "sell", close_qty)
+            _record_trade(sym)
 
         if short_extra <= 0:
             continue
@@ -528,6 +876,8 @@ async def rebalance_once(conn: asyncpg.Connection) -> None:
             logger.info("skip short %s (not shortable/ETB)", sym)
             continue
 
+        if not _should_execute_order(sym, "sell", is_entry=True, is_exit=False, reason="open_short"):
+            continue
         try:
             ack = await _call_blocking(alp.place_short_sell, sym, short_extra, ALPACA_TIF)
         except Exception as exc:
@@ -536,16 +886,39 @@ async def rebalance_once(conn: asyncpg.Connection) -> None:
             continue
 
         await _persist_fill(sym, "sell", short_extra, "ALPACA", ack)
+        _record_trade(sym)
 
         if CFG["use_trailing_stops"]:
             try:
-                await _call_blocking(
-                    alp.trailing_buy_to_cover,
-                    sym,
-                    CFG["trail_pct"],
-                    short_extra,
-                    ALPACA_TIF,
-                )
+                pos_meta = state.positions.get(sym)
+                available = _position_available_qty(pos_meta) if pos_meta else short_extra
+                if pos_meta and available <= 0:
+                    logger.info(
+                        "skip trailing stop for %s (no available qty; held_for_orders=%s)",
+                        sym,
+                        pos_meta.get("qty_held_for_orders"),
+                    )
+                else:
+                    opens = await get_open_orders(sym)
+                    has_exit_order = any(o.get("side") == "buy" for o in opens)
+                    if has_exit_order:
+                        logger.info(
+                            "skip trailing stop for %s (existing buy-side exits=%s)",
+                            sym,
+                            len(opens),
+                        )
+                    else:
+                        await _call_blocking(
+                            alp.trailing_buy_to_cover,
+                            sym,
+                            CFG["trail_pct"],
+                            short_extra,
+                            ALPACA_TIF,
+                        )
+            except HTTPStatusError as exc:
+                body = exc.response.text if exc.response else ""
+                status = exc.response.status_code if exc.response else "HTTP"
+                logger.warning("trailing stop placement failed for %s: %s %s", sym, status, body)
             except Exception as exc:
                 logger.warning("trailing stop placement failed for %s: %s", sym, exc)
 
@@ -562,18 +935,25 @@ async def rebalance_once(conn: asyncpg.Connection) -> None:
         residual = qty - cover_qty
 
         if cover_qty > 0:
+            if not _should_execute_order(sym, "buy", is_entry=False, is_exit=True, reason="cover_short"):
+                continue
             try:
                 ack = await _call_blocking(alp.buy_to_cover, sym, cover_qty, ALPACA_TIF)
             except Exception as exc:
                 logger.warning("buy-to-cover failed for %s: %s", sym, exc)
                 await _submit_market(sym, "buy", cover_qty)
                 _SHORT_COOLDOWNS.pop(sym, None)
+                _record_trade(sym)
             else:
                 _SHORT_COOLDOWNS.pop(sym, None)
                 await _persist_fill(sym, "buy", cover_qty, "ALPACA", ack)
+                _record_trade(sym)
 
         if residual > 0:
+            if not _should_execute_order(sym, "buy", is_entry=True, is_exit=False, reason="open_long"):
+                continue
             await _submit_market(sym, "buy", residual)
+            _record_trade(sym)
 
 
 async def main() -> None:

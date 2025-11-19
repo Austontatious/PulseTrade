@@ -106,6 +106,37 @@ PyTorch Geometric wheels are CUDA-specific; if `pip install torch-geometric` fai
 4. `make train.nbeats` – trains a global daily N-BEATS using the compiled dataset and writes `state.pt`, `config.json`, `scaler.pkl`, and `VERSION` under `/mnt/data/models/kronos-nbeats/<run-id>`.
 5. Point `KRONOS_NBEATS_MODEL_DIR` in `.env` to the latest `<run-id>` and restart `kronos-nbeats` (`make up`) to serve the pretrained artifact without per-request fitting.
 
+### Alpaca-universe enrichment (sentiment + price targets)
+
+For full-universe training with the new FMP sentiment + v4 price target features:
+
+```
+# 1) Build enriched dataset (≥420-day lookback, ~3400 symbols)
+python tools/kronos_data/build_alpaca_training_set.py \
+  --symbols db/alpaca_universe.symbols.txt \
+  --lookback-days 190 \
+  --out /mnt/data/kronos_data/processed/nbeats_alpaca_daily.parquet
+
+# 2) Train N-BEATS (covariates currently ignored by NeuralForecast)
+python tools/kronos_data/train_nbeats.py \
+  --data /mnt/data/kronos_data/processed/nbeats_alpaca_daily.parquet \
+  --out /mnt/data/models/kronos-nbeats \
+  --input-size 126 --horizon 5 \
+  --feature-cols "" \
+  --residuals-out /mnt/data/kronos_data/processed/nbeats_alpaca_residuals.parquet \
+  --min-holdout-days 60 --min-holdout-frac 0.2 \
+  --devices 1
+
+# 3) Rank symbols by validation residuals (Top 100) and refresh the trading universe
+python tools/kronos_data/rank_best_fit.py \
+  --residuals /mnt/data/kronos_data/processed/nbeats_alpaca_residuals.parquet \
+  --top-k 100 \
+  --report reports/top100_best_fit.json \
+  --update-file services/ingest/universe_symbols.txt
+```
+
+Wrap everything via `tools/pipeline/train_nbeats_alpaca.py` to automate weekly refreshes. The builder forward/back-fills sentiment/target covariates per symbol and literal `0.0` stands in for “no signal yet”. The trainer exposes `--min-holdout-*` knobs and falls back to a global chronological split if the per-symbol window is still too short. Pass `--devices 1` on single-GPU hosts to avoid NCCL OOMs. Covariates are persisted in the dataset even though the current NeuralForecast release logs “ignored” warnings; once `X_df` is supported upstream, remove the warning and feed the covariate frame.
+
 ## Runtime Watchdog (Recommended)
 
 - `docker-compose.yml` defines `restart: unless-stopped` for `kronos-nbeats` and `kronos-graph`, so Docker will automatically respawn the containers if they crash.

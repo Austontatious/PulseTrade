@@ -3,6 +3,7 @@ WORKDIR /app
 COPY libs/common /app/libs/common
 COPY libs/portfolio /app/libs/portfolio
 COPY libs/broker /app/libs/broker
+COPY libs/planner /app/libs/planner
 ENV PYTHONPATH=/app/libs:${PYTHONPATH}
 RUN pip install --no-cache-dir asyncpg orjson numpy httpx
 RUN pip install --no-cache-dir -e /app/libs/common

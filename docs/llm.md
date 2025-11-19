@@ -1,6 +1,6 @@
-# LLM Runbook (“Lexi” shared instance)
+# LLM Runbook (“Finance” shared instance)
 
-PulseTrade now connects to the **Lexi** vLLM server that runs alongside (but outside) the Docker Compose stack. No `llm` container is launched by Compose; instead, all callers hit an OpenAI-compatible endpoint exposed on the host at `http://host.docker.internal:8008/v1`.
+PulseTrade now connects to the **Finance** vLLM server that runs alongside (but outside) the Docker Compose stack. No `llm` container is launched by Compose; instead, all callers hit an OpenAI-compatible endpoint exposed on the host at `http://host.docker.internal:9009/v1`.
 
 ## Overview
 
@@ -10,7 +10,7 @@ PulseTrade now connects to the **Lexi** vLLM server that runs alongside (but out
   export CUDA_VISIBLE_DEVICES=0,1,2,3
   /mnt/data/vllm-venv/bin/python -m vllm.entrypoints.openai.api_server \
     --model /mnt/data/models/Qwen/Qwen2.5-32B-AGI \
-    --served-model-name Lexi \
+    --served-model-name Finance \
     --tensor-parallel-size 4 \
     --dtype float16 \
     --max-model-len 4096 \
@@ -21,7 +21,7 @@ PulseTrade now connects to the **Lexi** vLLM server that runs alongside (but out
     --trust-remote-code \
     --download-dir /mnt/data/models \
     --disable-custom-all-reduce \
-    --host 0.0.0.0 --port 8008
+    --host 0.0.0.0 --port 9009
   ```
 
 - Consumers inside Compose:
@@ -29,7 +29,7 @@ PulseTrade now connects to the **Lexi** vLLM server that runs alongside (but out
   - API `/llm` routes (health + ad-hoc chat).
   - Analytics `/analytics/recent`.
   - Admin `/llm/admin/*` and strategist tooling.
-- Networking: `docker-compose.yml` injects `extra_hosts: ["host.docker.internal:host-gateway"]` for API/forecast so they can reach port `8008` on the host.
+- Networking: `docker-compose.yml` injects `extra_hosts: ["host.docker.internal:host-gateway"]` for API/forecast so they can reach port `9009` on the host.
 
 ## Configuration
 
@@ -37,8 +37,8 @@ Environment knobs (see `.env` / `.env.example`):
 
 | Variable | Description |
 | --- | --- |
-| `LLM_BASE_URL` | Base URL used by core services (`http://host.docker.internal:8008/v1`) |
-| `LLM_MODEL` | Model name advertised by Lexi (e.g., `Lexi`) |
+| `LLM_BASE_URL` | Base URL used by core services (`http://host.docker.internal:9009/v1`) |
+| `LLM_MODEL` | Model name advertised by Finance (e.g., `Finance`) |
 | `LLM_DTYPE` | Precision (`float16`, `bfloat16`, etc.) |
 | `LLM_MAX_TOKENS` | Context window passed to vLLM (`--max-model-len`) |
 | `LLM_GPU_UTILIZATION` | Fractional GPU memory reservation |
@@ -53,16 +53,16 @@ Prompts are versioned in `configs/llm_prompts.yaml`. Use the helper in `libs/llm
 
 ## Health checks
 
-- Through API proxy: `curl -s http://localhost:8001/llm/health` (returns cached flag + `ok` if Lexi replies with “OK”)
-- Direct host endpoint: `curl -s http://localhost:8008/v1/models`
+- Through API proxy: `curl -s http://localhost:8001/llm/health` (returns cached flag + `ok` if Finance replies with “OK”)
+- Direct host endpoint: `curl -s http://localhost:9009/v1/models`
 
 ## Troubleshooting
 
 | Symptom | Action |
 | --- | --- |
-| API health check returns `Connection refused` | Confirm the host Lexi process is running and listening on `0.0.0.0:8008`. |
-| API health returns `{ok:false}` but Lexi is up | Lexi’s response must be the literal string `OK` for the proxy to mark it healthy; adjust the health prompt or response template. |
-| CUDA OOM inside Lexi | Lower `--max-model-len`, `--gpu-memory-utilization`, or reduce tensor-parallel size; restart the host process. |
+| API health check returns `Connection refused` | Confirm the host Finance process is running and listening on `0.0.0.0:9009`. |
+| API health returns `{ok:false}` but Finance is up | Finance’s response must be the literal string `OK` for the proxy to mark it healthy; adjust the health prompt or response template. |
+| CUDA OOM inside Finance | Lower `--max-model-len`, `--gpu-memory-utilization`, or reduce tensor-parallel size; restart the host process. |
 | Policy filter rejects every trade | Inspect `features->'llm'->'policy'->'raw'` in the `forecasts` table for the raw LLM response |
 | Summaries missing | `/analytics/recent` returns `summary=""` when the LLM is unreachable or times out |
 | Replay returns cached response | Call `/llm/admin/replay` with `{"id": ..., "force": true}` to bypass the cache |

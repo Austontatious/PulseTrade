@@ -101,3 +101,13 @@ def trailing_buy_to_cover(symbol: str, trail_percent: float, qty: int, tif: str 
         "time_in_force": (tif or DEFAULT_TIF or "day"),
     }
     return _request("POST", "/orders", json=payload)
+
+
+def get_position(symbol: str) -> Dict[str, Any]:
+    """Return the raw Alpaca position payload for the given symbol."""
+    try:
+        return _request("GET", f"/positions/{symbol.upper()}")
+    except httpx.HTTPStatusError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            return {}
+        raise

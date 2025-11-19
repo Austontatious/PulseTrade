@@ -20,6 +20,7 @@ _ord_tokens = _ORD_CAP
 _ord_last = time.monotonic()
 _pos_tokens = _POS_CAP
 _pos_last = time.monotonic()
+_open_cache: Dict[str, Dict[str, Any]] = {}
 
 async def _acquire(kind: str) -> None:
     # Cooperative async sleep based rate limiter
@@ -62,6 +63,10 @@ def _positions_url(symbol: str) -> str:
     if base.endswith("/v2"):
         return f"{base}/positions/{symbol}"
     return f"{base}/v2/positions/{symbol}"
+
+
+def _cancel_order_url(order_id: str) -> str:
+    return f"{_orders_url()}/{order_id}"
 
 async def submit_order(
     symbol: str,
@@ -202,7 +207,7 @@ async def get_all_positions() -> List[Dict[str, Any]]:
         except Exception:
             return []
 
-async def close_position(symbol: str) -> Optional[Dict[str, Any]]:
+async def close_position(symbol: str, cancel_orders: bool = False) -> Optional[Dict[str, Any]]:
     """Close the entire position for the given symbol via Alpaca.
 
     Uses DELETE /v2/positions/{symbol}. Returns response JSON or None on failure.
@@ -215,10 +220,11 @@ async def close_position(symbol: str) -> Optional[Dict[str, Any]]:
         "APCA-API-KEY-ID": ALPACA_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET,
     }
+    params = {"cancel_orders": "true"} if cancel_orders else None
     await _acquire('pos')
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            resp = await client.delete(url, headers=headers)
+            resp = await client.delete(url, headers=headers, params=params)
             if resp.status_code >= 400:
                 try:
                     print("alpaca close position error:", resp.status_code, resp.text)
@@ -258,9 +264,6 @@ async def get_account() -> Dict[str, Any]:
         except Exception:
             return {}
 
-# Open orders (dedupe)
-_open_cache: Dict[str, Dict[str, float]] = {}
-
 def _orders_list_url() -> str:
     base = (ALPACA_BASE or "https://paper-api.alpaca.markets").rstrip("/")
     if base.endswith("/v2"):
@@ -293,6 +296,57 @@ async def get_open_orders(symbol: str) -> List[Dict[str, Any]]:
             data = [o for o in all_orders if o.get("symbol") == symbol and o.get("status") == "open"]
     _open_cache[cache_key] = {"ts": now, "data": data}
     return data
+
+
+async def cancel_orders_for_symbol(symbol: str) -> int:
+    """Cancel all open orders for a specific symbol."""
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        return 0
+    symbol = symbol.upper()
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
+    params = {"status": "open", "limit": 200, "symbols": symbol}
+    await _acquire('ord')
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(_orders_list_url(), headers=headers, params=params)
+        if resp.status_code >= 400:
+            try:
+                print("alpaca cancel list error:", resp.status_code, resp.text)
+            except Exception:
+                pass
+            return 0
+        try:
+            open_orders = [
+                order for order in resp.json()
+                if order.get("symbol", "").upper() == symbol and order.get("status") == "open"
+            ]
+        except Exception:
+            open_orders = []
+    cancelled = 0
+    if not open_orders:
+        _open_cache.pop(symbol, None)
+        return 0
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for order in open_orders:
+            oid = order.get("id")
+            if not oid:
+                continue
+            await _acquire('ord')
+            try:
+                resp = await client.delete(_cancel_order_url(oid), headers=headers)
+                if resp.status_code < 400:
+                    cancelled += 1
+                else:
+                    try:
+                        print("alpaca cancel order error:", resp.status_code, resp.text)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                print("alpaca cancel order exception:", exc)
+    _open_cache.pop(symbol, None)
+    return cancelled
 
 async def latest_quote(ticker: str) -> Optional[Dict[str, Any]]:
     # This executor-level quote fetch uses DB to keep it simple

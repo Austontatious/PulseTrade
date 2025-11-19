@@ -5,17 +5,49 @@ from typing import List
 import random
 import httpx
 import asyncpg
-from .config import DB_DSN
+from pathlib import Path
+from dotenv import load_dotenv
+
+try:
+    from services.ingest.config import DB_DSN
+except ImportError:  # running as script, fall back to local module
+    from config import DB_DSN  # type: ignore
+
+_DOTENV_PATH = next((parent / ".env" for parent in Path(__file__).resolve().parents if (parent / ".env").exists()), None)
+if _DOTENV_PATH:
+    load_dotenv(dotenv_path=_DOTENV_PATH, override=False)
 
 API_KEY = os.getenv("ALPACA_API_KEY_ID")
 API_SECRET = os.getenv("ALPACA_API_SECRET_KEY")
 BASELINE_SYMBOLS = [s.strip() for s in os.getenv("ALPACA_SYMBOLS", "AAPL,MSFT,SPY").split(",") if s.strip()]
+RPM = int(os.getenv("ALPACA_REST_RPM", "120"))
+BATCH = int(os.getenv("ALPACA_REST_BATCH", "50"))
+BATCH_PAUSE_S = float(os.getenv("ALPACA_REST_BATCH_PAUSE_S", "2.0"))
+PER_REQ_SLEEP = 60.0 / max(1, RPM)
+MAX_BACKOFF = float(os.getenv("ALPACA_REST_MAX_BACKOFF_S", "30.0"))
 
 def _headers():
     return {
         "APCA-API-KEY-ID": API_KEY or "",
         "APCA-API-SECRET-KEY": API_SECRET or "",
     }
+
+
+async def _throttle_sleep(counter: int) -> None:
+    if PER_REQ_SLEEP > 0:
+        await asyncio.sleep(PER_REQ_SLEEP)
+    if BATCH > 0 and counter % BATCH == 0 and BATCH_PAUSE_S > 0:
+        await asyncio.sleep(BATCH_PAUSE_S)
+
+
+async def _request_with_backoff(client: httpx.AsyncClient, url: str, params: dict) -> httpx.Response:
+    sleep_s = max(PER_REQ_SLEEP, 0.0)
+    while True:
+        resp = await client.get(url, headers=_headers(), params=params, timeout=10)
+        if resp.status_code != 429:
+            return resp
+        await asyncio.sleep(max(sleep_s, 0.5))
+        sleep_s = min(MAX_BACKOFF, sleep_s * 2 if sleep_s else 1.0)
 
 def _parse_ts(val: str | int | float | None) -> dt.datetime | None:
     if val is None:
@@ -52,7 +84,7 @@ async def _fetch_latest(symbol: str, feed: str, client: httpx.AsyncClient) -> tu
     # Use the per-symbol endpoint to simplify parsing
     url = f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest"
     params = {"feed": feed}
-    r = await client.get(url, headers=_headers(), params=params, timeout=10)
+    r = await _request_with_backoff(client, url, params)
     if r.status_code != 200:
         try:
             print("alpaca REST status", r.status_code, url, r.text[:200])
@@ -101,7 +133,7 @@ async def backfill_once(feeds: List[str] | None = None, max_symbols: int | None 
             symbols = symbols[:max_symbols]
         async with httpx.AsyncClient() as client:
             for feed in feeds_to_use:
-                for sym in symbols:
+                for idx, sym in enumerate(symbols, 1):
                     try:
                         ts, price = await _fetch_latest(sym, feed, client)
                         if ts and price:
@@ -117,6 +149,8 @@ async def backfill_once(feeds: List[str] | None = None, max_symbols: int | None 
                             inserted += 1
                     except Exception as exc:
                         print("alpaca REST backfill error:", sym, feed, exc)
+                    finally:
+                        await _throttle_sleep(idx)
     finally:
         await conn.close()
     return inserted
@@ -150,7 +184,7 @@ async def run_alpaca_rest_poller() -> None:
                 max_per = int(os.getenv("ALPACA_REST_MAX_PER_CYCLE", "50"))
                 symbols = symbols[:max_per]
                 for feed in feeds:
-                    for sym in symbols:
+                    for idx, sym in enumerate(symbols, 1):
                         try:
                             ts, price = await _fetch_latest(sym, feed, client)
                             if ts and price:
@@ -166,6 +200,8 @@ async def run_alpaca_rest_poller() -> None:
                                 print("alpaca REST inserted", sym, feed, ts, price)
                         except Exception as e:
                             print("alpaca REST poll error:", sym, feed, e)
+                        finally:
+                            await _throttle_sleep(idx)
                 await asyncio.sleep(interval)
     finally:
         await conn.close()

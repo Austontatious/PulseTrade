@@ -1,0 +1,4 @@
+ALTER TABLE social_features
+    ADD COLUMN IF NOT EXISTS pos_count INTEGER,
+    ADD COLUMN IF NOT EXISTS neg_count INTEGER,
+    ADD COLUMN IF NOT EXISTS neu_count INTEGER;

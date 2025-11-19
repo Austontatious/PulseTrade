@@ -1,0 +1,136 @@
+{
+  "date": "2025-11-16",
+  "total_candidates": 2,
+  "active_count": 2,
+  "candidates": [
+    {
+      "mu": 73.50939665877567,
+      "sigma": 0.008757393747026651,
+      "p_success": 1.0,
+      "p_loss_upper": 5.000949662870114e-05,
+      "mu_lower": 73.50895870592261,
+      "score": 73.50063926502864,
+      "ok_to_trade": true,
+      "sims": 1536,
+      "symbol": "FBC",
+      "side": "short",
+      "reason": "plan:ShortIntraday|Strong short signal, neutral sentiment, no earnings soon.",
+      "actions": [
+        {
+          "name": "entry_open",
+          "kind": "entry",
+          "window": "09:35-10:00",
+          "direction": "sell",
+          "sizing": "notional"
+        },
+        {
+          "name": "exit_close",
+          "kind": "exit",
+          "window": "15:45-16:00",
+          "direction": "buy",
+          "sizing": "full"
+        }
+      ]
+    },
+    {
+      "mu": 79.80411934709512,
+      "sigma": 0.008986555360397061,
+      "p_success": 1.0,
+      "p_loss_upper": 5.000949662870114e-05,
+      "mu_lower": 79.80366993398512,
+      "score": 79.79513279173473,
+      "ok_to_trade": true,
+      "sims": 1536,
+      "symbol": "ACTT",
+      "side": "short",
+      "reason": "plan:ShortIntraday|Strong short signal, neutral sentiment, no earnings soon.",
+      "actions": [
+        {
+          "name": "entry_open",
+          "kind": "entry",
+          "window": "09:35-10:00",
+          "direction": "sell",
+          "sizing": "notional"
+        },
+        {
+          "name": "exit_close",
+          "kind": "exit",
+          "window": "15:45-16:00",
+          "direction": "buy",
+          "sizing": "full"
+        }
+      ]
+    }
+  ],
+  "active": [
+    {
+      "mu": 79.80411934709512,
+      "sigma": 0.008986555360397061,
+      "p_success": 1.0,
+      "p_loss_upper": 5.000949662870114e-05,
+      "mu_lower": 79.80366993398512,
+      "score": 79.79513279173473,
+      "ok_to_trade": true,
+      "sims": 1536,
+      "symbol": "ACTT",
+      "side": "short",
+      "reason": "plan:ShortIntraday|Strong short signal, neutral sentiment, no earnings soon.",
+      "actions": [
+        {
+          "name": "entry_open",
+          "kind": "entry",
+          "window": "09:35-10:00",
+          "direction": "sell",
+          "sizing": "notional"
+        },
+        {
+          "name": "exit_close",
+          "kind": "exit",
+          "window": "15:45-16:00",
+          "direction": "buy",
+          "sizing": "full"
+        }
+      ]
+    },
+    {
+      "mu": 73.50939665877567,
+      "sigma": 0.008757393747026651,
+      "p_success": 1.0,
+      "p_loss_upper": 5.000949662870114e-05,
+      "mu_lower": 73.50895870592261,
+      "score": 73.50063926502864,
+      "ok_to_trade": true,
+      "sims": 1536,
+      "symbol": "FBC",
+      "side": "short",
+      "reason": "plan:ShortIntraday|Strong short signal, neutral sentiment, no earnings soon.",
+      "actions": [
+        {
+          "name": "entry_open",
+          "kind": "entry",
+          "window": "09:35-10:00",
+          "direction": "sell",
+          "sizing": "notional"
+        },
+        {
+          "name": "exit_close",
+          "kind": "exit",
+          "window": "15:45-16:00",
+          "direction": "buy",
+          "sizing": "full"
+        }
+      ]
+    }
+  ],
+  "config": {
+    "weekly_universe_size": 100,
+    "daily_candidate_count": 10,
+    "daily_max_trades": 20,
+    "max_actions_per_stock": 2,
+    "eps_mu": 0.0005,
+    "eps_p": 0.05,
+    "p_loss_max": 0.45,
+    "mu_min": 0.0001,
+    "lambda_risk": 1.0
+  }
+}

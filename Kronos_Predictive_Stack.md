@@ -32,7 +32,7 @@ Current components
   - Impl: risk layer in PulseTrade policy; includes symbol/sector/global breakers and headline‑risk breaker
  - LLM Policy / Explainability Layer
    - Purpose: turn numerical forecasts, fundamentals, and alternative‑data flows into natural‑language rationales and structured allow/deny flags that can gate orders.
-   - Impl: host‑side vLLM server (“Lexi”) accessed via `libs.llm.run_and_log.LLMRunner` from `services/forecast/forecast/llm_hooks.py`; outputs land in `forecasts.features->'llm'` and feed the allocator when `PT_BLOCK_IF_LLM_DENY=true`.
+   - Impl: host‑side vLLM server (“Finance”) accessed via `libs.llm.run_and_log.LLMRunner` from `services/forecast/forecast/llm_hooks.py`; outputs land in `forecasts.features->'llm'` and feed the allocator when `PT_BLOCK_IF_LLM_DENY=true`.
 
 2. Data Architecture and Training Sources
 ----------------------------------------
@@ -166,7 +166,7 @@ Weekly retrains (the “Wednesday night” job) now run through dedicated CLI en
 6.2 LLM Overlay and Order‑Gate Policy
 -------------------------------------
 
-Kronos uses a separate large‑language‑model layer (“Lexi”) to translate raw signals and context into human‑readable narratives and structured policy recommendations that can gate trades.
+Kronos uses a separate large‑language‑model layer (“Finance”) to translate raw signals and context into human‑readable narratives and structured policy recommendations that can gate trades.
 
 - **Runtime integration**
   - The forecast service (`services/forecast/forecast/run.py`) calls into `generate_rationale` and `policy_filter` in `llm_hooks.py` after Kronos produces a forecast bundle and factor snapshot.
